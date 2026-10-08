@@ -189,6 +189,9 @@ fn get_info_with_timeout(
         .send()
         .context("receiver did not answer")?;
     if !response.status().is_success() {
+        crate::telemetry::crumb("connect.receiver_info")
+            .field("status", response.status().as_u16())
+            .emit();
         bail!("receiver answered {}", response.status());
     }
     response.json().context("receiver sent an unreadable reply")
@@ -199,6 +202,10 @@ fn get_info_with_timeout(
 /// Four probes run at a time, with two seconds per probe and six overall.
 pub fn resolve_receivers(receivers: Vec<Receiver>) -> Result<Vec<Receiver>> {
     let http = reqwest::blocking::Client::builder().no_proxy().build()?;
+    let advertised = receivers.len();
+    let unanswered = std::sync::atomic::AtomicUsize::new(0);
+    let unusable = std::sync::atomic::AtomicUsize::new(0);
+    let started = std::time::Instant::now();
     let pending = std::sync::Mutex::new(receivers.into_iter());
     let found = std::sync::Mutex::new(HashMap::new());
     let deadline = std::time::Instant::now() + Duration::from_secs(6);
@@ -218,9 +225,11 @@ pub fn resolve_receivers(receivers: Vec<Receiver>) -> Result<Vec<Receiver>> {
                         &receiver,
                         remaining.min(Duration::from_secs(2)),
                     ) else {
+                        unanswered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     };
                     if info.device_id.trim().is_empty() || info.remote_name.trim().is_empty() {
+                        unusable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
                     }
                     receiver.name = info.remote_name;
@@ -240,6 +249,14 @@ pub fn resolve_receivers(receivers: Vec<Receiver>) -> Result<Vec<Receiver>> {
         .into_values()
         .collect();
     receivers.sort_by(|a, b| a.name.cmp(&b.name));
+    // Counts only: receiver names and addresses are private.
+    crate::telemetry::crumb("connect.receivers_resolved")
+        .field("advertised", advertised)
+        .field("resolved", receivers.len())
+        .field("unanswered", unanswered.into_inner())
+        .field("unusable", unusable.into_inner())
+        .ms("duration_ms", started.elapsed())
+        .emit();
     Ok(receivers)
 }
 
@@ -280,6 +297,10 @@ pub fn add_user(
     let reply: AddUserReply = response
         .json()
         .context("receiver sent an unreadable reply")?;
+    crate::telemetry::crumb("connect.receiver_add_user")
+        .field("status", reply.status)
+        .field("receiver_kind", info.kind())
+        .emit();
     // 101 is this interface's "OK".
     if reply.status == 101 {
         return Ok(());

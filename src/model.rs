@@ -408,6 +408,14 @@ impl<T> PagedList<T> {
         let next_offset = page.next_offset();
         if window {
             if self.total.is_some_and(|total| total != page.total) {
+                // The list changed under the reader: every cached window is
+                // dropped and read again.
+                crate::telemetry::crumb("ui.page_total_changed")
+                    .field("previous", self.total)
+                    .field("total", page.total)
+                    .field("offset", offset)
+                    .field("windows", self.windows.len())
+                    .emit();
                 self.clear_windows();
                 self.items.clear();
             } else {
@@ -488,6 +496,12 @@ impl<T> PagedList<T> {
     }
 
     pub fn fail(&mut self, error: String) {
+        crate::telemetry::crumb("ui.page_failed")
+            .field("offset", self.window_request.or(self.next_offset))
+            .field("rows", self.items.len())
+            .field("total", self.total)
+            .text("error", &error)
+            .emit();
         self.loading = false;
         self.error = Some(error);
         self.loaded_once = true;
