@@ -16,6 +16,8 @@ use librespot_playback::decoder::AudioPacket;
 use librespot_playback::mixer::VolumeGetter;
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
 
+use crate::sink::metrics;
+
 /// Half a second of audio.
 const KEPT: usize = SAMPLE_RATE as usize / 2;
 /// How far behind the newest sample the visualiser looks, so that it shows
@@ -87,7 +89,16 @@ impl AudioTap {
     /// Adds scaled stereo samples to the mono analyser buffer and, when
     /// attached, MilkDrop's stereo shared-memory ring.
     pub fn push(&self, interleaved: &[f64], gain: f32) {
-        let mut samples = self.samples.lock().unwrap_or_else(|p| p.into_inner());
+        // The interface reads this buffer every frame; count the times the
+        // player's thread has to wait for it.
+        let mut samples = match self.samples.try_lock() {
+            Ok(samples) => samples,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                metrics::tap_lock_waited();
+                self.samples.lock().unwrap_or_else(|p| p.into_inner())
+            }
+        };
         let (frames, _) = interleaved.as_chunks::<{ NUM_CHANNELS as usize }>();
         #[cfg(feature = "milkdrop")]
         let shm = self.shm.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -198,16 +209,33 @@ fn full_scale(volume: f64, applied: bool) -> Option<f64> {
 
 impl Sink for Tapped {
     fn start(&mut self) -> SinkResult<()> {
-        self.inner.start()
+        metrics::feeding(true);
+        metrics::phase(metrics::START);
+        let result = self.inner.start();
+        metrics::phase(metrics::OUTSIDE);
+        result
     }
 
     fn stop(&mut self) -> SinkResult<()> {
+        metrics::feeding(false);
+        metrics::phase(metrics::STOP);
         self.tap.clear();
-        self.inner.stop()
+        let result = self.inner.stop();
+        metrics::phase(metrics::OUTSIDE);
+        result
     }
 
     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
+        // The outermost sink, so its entries and exits are the player
+        // thread's heartbeat for every backend.
+        let began = metrics::write_began();
         if self.control.take_processing_reset() {
+            if began.is_some() {
+                crate::telemetry::crumb("audio.processing_reset")
+                    .field("eq_on", self.eq.is_on())
+                    .field("limiter_gain", self.limiter.gain())
+                    .emit();
+            }
             self.eq.reset();
             self.limiter = crate::limiter::Limiter::new(f64::from(SAMPLE_RATE));
             self.tap.clear();
@@ -215,6 +243,10 @@ impl Sink for Tapped {
         let packet = match packet {
             AudioPacket::Samples(mut samples) => {
                 self.eq.process(&mut samples);
+                // Measured where the visualisers look, so the volume knob
+                // never reads as silence.
+                let level = began.map(|_| metrics::level(&samples));
+                metrics::phase(metrics::TAP);
                 // Post-EQ, pre-volume, pre-normalisation: the equalizer
                 // shapes what the bars show; the volume knob and the
                 // loudness housekeeping never move them.
@@ -228,20 +260,39 @@ impl Sink for Tapped {
                     1.0
                 };
                 self.tap.push(&samples, restore);
+                metrics::phase(metrics::PROCESS);
                 let attenuation = self.volume.attenuation_factor();
                 if self.applies_volume {
                     for sample in &mut samples {
                         *sample *= attenuation;
                     }
                 }
+                let mut limited = false;
                 if let Some(full_scale) = full_scale(attenuation, self.applies_volume) {
                     self.limiter.process(&mut samples, full_scale);
+                    limited = true;
+                }
+                if let (Some(began), Some(level)) = (began, level) {
+                    metrics::shaped(
+                        began.elapsed(),
+                        samples.len() / NUM_CHANNELS as usize,
+                        level,
+                        limited.then_some(self.limiter.gain()),
+                        self.eq.is_on(),
+                    );
                 }
                 AudioPacket::Samples(samples)
             }
             raw => raw,
         };
-        self.inner.write(packet, converter)
+        let result = self.inner.write(packet, converter);
+        // librespot's own sinks (the only ones this applies volume for) have
+        // no Writer to end traces at the first sound; RodioSink ends its own.
+        if self.applies_volume && result.is_ok() && crate::telemetry::tracing() {
+            metrics::first_audio();
+        }
+        metrics::write_ended();
+        result
     }
 }
 

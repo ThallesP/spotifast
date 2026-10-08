@@ -25,6 +25,7 @@ use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
 use rodio::Source;
 
 use crate::resample::Resampler;
+use crate::telemetry;
 
 /// The backend name Settings uses for this sink.
 pub const NAME: &str = "rodio";
@@ -90,6 +91,8 @@ struct AudioTarget {
 
 impl AudioControl {
     pub fn new(buffer_ms: u32) -> Arc<Self> {
+        metrics::register();
+        metrics::control_created();
         Arc::new(Self {
             target: Mutex::new(AudioTarget::default()),
             waiting_for_track: AtomicBool::new(false),
@@ -103,10 +106,15 @@ impl AudioControl {
     /// another Spotify client. Natural track changes retain gapless audio.
     pub(crate) fn handle_player_event(&self, event: &PlayerEvent) {
         match event {
-            PlayerEvent::TrackChanged { .. } => self.track_changed(),
+            PlayerEvent::TrackChanged { .. } => {
+                metrics::track_changed();
+                self.track_changed();
+            }
             PlayerEvent::Seeked { .. } => {
+                metrics::seeked();
                 let target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
                 if let Some(sink) = target.sink.upgrade() {
+                    metrics::seek_cut(sink.len());
                     sink.stop();
                 }
                 self.reset_output.store(true, Ordering::SeqCst);
@@ -114,9 +122,10 @@ impl AudioControl {
                 // Previous can rewind the current track after interrupting
                 // it. Release that gate, but never close it for a seek:
                 // the decoder is already sending audio from the new position.
-                self.track_changed();
+                self.release("seeked");
             }
-            PlayerEvent::Stopped { .. } => self.stopped(),
+            PlayerEvent::Stopped { .. } => self.release("stopped"),
+            PlayerEvent::Loading { .. } => metrics::loading(),
             _ => {}
         }
     }
@@ -125,13 +134,19 @@ impl AudioControl {
     /// change. Repeated skips share the same handoff.
     pub fn interrupt(&self) {
         if self.waiting_for_track.swap(true, Ordering::SeqCst) {
+            metrics::interrupt_repeated();
             return;
         }
+        let began = metrics::gate_closed();
         let (sink, envelope) = {
             let target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
             (target.sink.upgrade(), target.envelope.clone())
         };
+        // The chunks queued when the fade began, and whether it reached
+        // silence before the deadline.
+        let mut fade = None;
         if let (Some(sink), Some(envelope)) = (&sink, &envelope) {
+            let queued = sink.len();
             envelope.fade_out();
             let wait =
                 Duration::from_millis(u64::from(self.buffer_ms)).saturating_add(INTERRUPT_FADE * 2);
@@ -139,22 +154,32 @@ impl AudioControl {
             while !envelope.silent() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(1));
             }
+            fade = Some((queued, envelope.silent()));
             // Unlike `clear`, this does not wait for every queued source.
             // The replacement gets a fresh rodio sink on its first write.
             sink.stop();
         }
         self.reset_output.store(true, Ordering::SeqCst);
         self.reset_processing.store(true, Ordering::SeqCst);
+        metrics::interrupted(began, fade, self.buffer_ms);
     }
 
     /// Opens the write gate once librespot has left the old decoder behind.
     pub fn track_changed(&self) {
-        self.waiting_for_track.store(false, Ordering::SeqCst);
+        self.release("track_changed");
     }
 
     /// Releases the gate if the requested replacement stopped instead.
+    /// Engine::command calls it when the command could not be sent.
     pub fn stopped(&self) {
-        self.waiting_for_track.store(false, Ordering::SeqCst);
+        self.release("command_failed");
+    }
+
+    /// Opens the write gate, reporting how long it was closed when it was.
+    fn release(&self, by: &'static str) {
+        if self.waiting_for_track.swap(false, Ordering::SeqCst) {
+            metrics::gate_released(by);
+        }
     }
 
     fn waiting_for_track(&self) -> bool {
@@ -343,6 +368,7 @@ impl Drop for TransitionSource {
         self.queued
             .consumed
             .fetch_add(u64::from(self.remaining), Ordering::Relaxed);
+        metrics::unplayed(self.remaining);
     }
 }
 
@@ -357,6 +383,7 @@ impl Iterator for TransitionSource {
             self.gain = self.interrupt.next_gain() * self.transport.next_gain();
             self.remaining = self.remaining.saturating_sub(1);
             self.queued.consumed.fetch_add(1, Ordering::Relaxed);
+            metrics::frame_supplied();
         }
         self.channel = (self.channel + 1) % NUM_CHANNELS as usize;
         Some(sample * self.gain)
@@ -398,6 +425,8 @@ pub struct RodioSink {
     buffer_ms: u32,
     control: Arc<AudioControl>,
     open: Opener,
+    /// What diagnostics remember between writes.
+    diag: metrics::Writer,
 }
 
 struct Output {
@@ -449,23 +478,35 @@ impl Output {
     /// new default output, or was let go after a long pause. Returns whether
     /// the queue was replaced, which needs the volume set again.
     fn run(&mut self, control: &AudioControl) -> Result<bool, OpenError> {
-        self.device.resume();
-        for error in self.device.take_errors() {
-            if error.is_fatal() {
-                log::error!("audio stream error: {error}");
-            } else {
-                log::warn!("audio stream error: {error}");
-            }
+        if self.device.is_paused() {
+            metrics::device_resuming();
         }
+        self.device.resume();
+        self.drain_errors();
+        let maintaining = Instant::now();
         match self.device.maintain() {
             Maintained::Reopened {
                 device,
                 sample_rate,
+                channels,
                 reason,
-                ..
-            } => log::info!("audio output reopened ({reason:?}): {device} at {sample_rate} Hz"),
-            Maintained::Failed(error) => return Err(error.into()),
-            Maintained::Unchanged | Maintained::Released => {}
+            } => {
+                crate::telemetry::private_term(&device);
+                log::info!("audio output reopened ({reason:?}): {device} at {sample_rate} Hz");
+                metrics::reopened(
+                    &device,
+                    (sample_rate, channels),
+                    reason,
+                    maintaining.elapsed(),
+                    self.sample_rate,
+                );
+            }
+            Maintained::Failed(error) => {
+                metrics::reopen_failed(&error, maintaining.elapsed());
+                return Err(error.into());
+            }
+            Maintained::Released => metrics::released(),
+            Maintained::Unchanged => {}
         }
         let made = self
             .made
@@ -475,8 +516,35 @@ impl Output {
         let Some(mixer) = made else {
             return Ok(false);
         };
+        let from_rate = self.sample_rate;
+        let dropped = self.queued.frames();
         self.attach(mixer, control);
+        metrics::format_changed(
+            self.device.device_name(),
+            from_rate,
+            self.sample_rate,
+            dropped,
+            self.resampler.is_some(),
+        );
         Ok(true)
+    }
+
+    /// Logs the errors the device reported since the last call, and returns
+    /// what kind each was.
+    fn drain_errors(&mut self) -> Vec<&'static str> {
+        let mut kinds = Vec::new();
+        for error in self.device.take_errors() {
+            let class = metrics::output_error(&error);
+            if error.is_fatal() {
+                log::error!("audio stream error: {error}");
+            } else if class != "xrun" || metrics::xrun_warning_due() {
+                log::warn!("audio stream error: {error}");
+            } else {
+                log::debug!("audio stream error: {error}");
+            }
+            kinds.push(class);
+        }
+        kinds
     }
 }
 
@@ -553,18 +621,37 @@ impl Render for MixerRender {
     }
 
     fn render(&mut self, out: &mut [f32]) {
+        // Diagnostics here are relaxed atomics only: this is the audio
+        // callback.
+        let began = metrics::callback_began();
+        // Samples with no source, and the loudest before volume, so that a
+        // turned-down output never reads as a silent one.
+        let mut missing = 0;
+        let mut peak = 0.0f32;
         match &mut self.source {
             Some(source) => {
                 let target = f32::from_bits(self.volume.load(Ordering::Relaxed));
                 for frame in out.chunks_mut(usize::from(self.format.1).max(1)) {
                     let gain = self.ramp.next_gain(target, self.format.0);
                     for sample in frame {
-                        *sample = source.next().unwrap_or(0.0) * gain;
+                        let value = match source.next() {
+                            Some(value) => value,
+                            None => {
+                                missing += 1;
+                                0.0
+                            }
+                        };
+                        peak = peak.max(value.abs());
+                        *sample = value * gain;
                     }
                 }
             }
-            None => out.fill(0.0),
+            None => {
+                out.fill(0.0);
+                missing = out.len();
+            }
         }
+        metrics::callback_ended(began, out.len(), self.format, missing, peak);
     }
 }
 
@@ -585,6 +672,7 @@ impl RodioSink {
             buffer_ms,
             control,
             open: open_output,
+            diag: metrics::Writer::default(),
         }
     }
 
@@ -620,9 +708,16 @@ impl RodioSink {
 
     /// As `open_if_needed`, reporting a failure to the interface.
     fn ensure_open(&mut self) -> SinkResult<()> {
+        let reopening = self.output.is_some();
         self.open_if_needed().map_err(|error| {
             let message = error.to_string();
             log::error!("{message}");
+            let reason = match (&error, reopening) {
+                (OpenError::NoDevice, _) => "no_device",
+                (OpenError::Device(_), true) => "reopen_failed",
+                (OpenError::Device(_), false) => "open_failed",
+            };
+            metrics::write_error(reason, &message, &[], None, self.device.is_some());
             (self.on_error)(message.clone());
             SinkError::ConnectionRefused(message)
         })
@@ -641,10 +736,16 @@ impl Sink for RodioSink {
     /// the app stays up as a Connect remote.
     fn start(&mut self) -> SinkResult<()> {
         take_precedence();
+        let starting = Instant::now();
+        let was_open = self.output.is_some();
+        let was_paused = self.output.as_ref().map(|output| output.device.is_paused());
+        self.diag.restart();
         if let Err(error) = self.open_if_needed() {
             log::debug!("audio output not open at start: {error}");
+            metrics::sink_started(starting.elapsed(), false, was_paused, Some(&error));
             return Ok(());
         }
+        metrics::sink_started(starting.elapsed(), !was_open, was_paused, None);
         self.apply_volume();
         if let Some(output) = &mut self.output {
             output.transport.fade_in();
@@ -655,23 +756,37 @@ impl Sink for RodioSink {
 
     /// Never fails: librespot exits the process when a sink cannot stop.
     fn stop(&mut self) -> SinkResult<()> {
+        metrics::stopping();
         if let Some(output) = &mut self.output {
+            let queued_ms = metrics::frames_ms(output.queued.frames(), output.sample_rate);
             // The drain below plays the queue out, so the ramp is cut to
             // what is in it. During steady playback that is the whole
             // 50 ms; just after a seek or a track change it is whatever has
             // been decoded since.
             output.transport.fade_out_over(output.queued.frames());
+            let draining = Instant::now();
             let deadline = Instant::now() + DRAIN_TIMEOUT;
             while !output.sink.empty() && !output.failed() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
+            let drain = metrics::Drain {
+                queued_ms,
+                took: draining.elapsed(),
+                drained: output.sink.empty(),
+                failed: output.failed(),
+                callback_age_ms: metrics::callback_age_ms(),
+            };
             output.sink.pause();
             // With the queue played out, the device can stop asking for
             // sound until Play: a paused app costs no audio work (#636).
+            let pausing = Instant::now();
             output.device.pause();
+            metrics::device_paused();
+            let pause_took = pausing.elapsed();
             output.transport.close();
             output.fed = false;
             output.last_write = None;
+            metrics::sink_stopped(drain, pause_took);
         }
         Ok(())
     }
@@ -681,17 +796,22 @@ impl Sink for RodioSink {
             .samples()
             .map_err(|error| SinkError::OnWrite(error.to_string()))?;
         if self.control.waiting_for_track() {
+            metrics::phase(metrics::GATE);
             // Muting must not remove decoder backpressure. Otherwise cached
             // audio races to EndOfTrack while Connect is still handling the
             // replacement load, and that old event can skip the chosen song.
             // Pace one discarded packet, then let librespot process commands.
             let frames = samples.len() / NUM_CHANNELS as usize;
+            metrics::gated(frames);
             thread::sleep(Duration::from_secs_f64(frames as f64 / SAMPLE_RATE as f64));
             return Ok(());
         }
         let samples = converter.f64_to_f32(samples);
         // Sound arriving without a Play first still has a device to go to.
+        metrics::phase(metrics::OPEN);
+        let opening = Instant::now();
         self.ensure_open()?;
+        metrics::inside(metrics::OPEN, opening.elapsed());
         if self.control.take_reset()
             && let Some(output) = &mut self.output
         {
@@ -706,6 +826,8 @@ impl Sink for RodioSink {
             output.fed = false;
             output.last_write = None;
             self.applied_volume = -1.0;
+            self.diag.restart();
+            metrics::sink_reset(output.sample_rate, output.resampler.is_some());
         }
         self.apply_volume();
         let Some(output) = &mut self.output else {
@@ -724,18 +846,28 @@ impl Sink for RodioSink {
                 .map(|last| now.duration_since(last).as_millis())
                 .unwrap_or(0);
             log::warn!("audio queue ran dry; next packet arrived after {late_ms} ms");
+            let late = output
+                .last_write
+                .map_or(Duration::ZERO, |last| now.duration_since(last));
+            self.diag
+                .ran_dry(late, output.sample_rate, output.resampler.is_some());
         }
         output.transport.fade_in();
         let frames = (samples.len() / NUM_CHANNELS as usize) as u32;
+        // Post-limiter and pre-volume: the sound the device should play.
+        let peak = telemetry::enabled().then(|| metrics::peak(&samples));
         let source = rodio::buffer::SamplesBuffer::new(
             NUM_CHANNELS as rodio::ChannelCount,
             output.sample_rate as rodio::SampleRate,
             samples,
         );
+        let queued_before = output.queued.frames();
         output
             .queued
             .appended
             .fetch_add(u64::from(frames), Ordering::Relaxed);
+        metrics::phase(metrics::QUEUE);
+        let appending = Instant::now();
         output.sink.append(TransitionSource::new(
             source,
             Arc::clone(&output.envelope),
@@ -743,18 +875,39 @@ impl Sink for RodioSink {
             Arc::clone(&output.queued),
             frames,
         ));
+        metrics::inside(metrics::QUEUE, appending.elapsed());
         output.fed = true;
         output.last_write = Some(now);
+        self.diag.appended(output, queued_before, peak);
         // Let rodio drain a little; without this the whole track would be
         // decoded into memory at once.
+        metrics::phase(metrics::BACKPRESSURE);
+        let waiting = Instant::now();
+        let mut stall_reported = false;
         while output.sink.len() > QUEUE_LIMIT {
             if output.failed() {
                 let message = "The audio output stopped working".to_string();
+                let output_errors = output.drain_errors();
+                metrics::write_error(
+                    "output_failed",
+                    &message,
+                    &output_errors,
+                    Some(metrics::frames_ms(
+                        output.queued.frames(),
+                        output.sample_rate,
+                    )),
+                    self.device.is_some(),
+                );
                 (self.on_error)(message.clone());
                 return Err(SinkError::OnWrite(message));
             }
+            if !stall_reported && waiting.elapsed() >= metrics::OUTPUT_STALL {
+                stall_reported = true;
+                metrics::output_stalled(waiting.elapsed(), output);
+            }
             thread::sleep(Duration::from_millis(10));
         }
+        metrics::write_done(output);
         Ok(())
     }
 }
@@ -823,6 +976,12 @@ fn open_output(
     buffer_ms: u32,
     control: &AudioControl,
 ) -> Result<Output, OpenError> {
+    // The callback's diagnostics read this clock, so it starts first.
+    metrics::start_clock();
+    // Device names are often a person's name; keep them out of telemetry.
+    if let Some(name) = preferred {
+        crate::telemetry::private_term(name);
+    }
     let made = MixerSlot::default();
     let volume = Arc::new(AtomicU32::new(0.0f32.to_bits()));
     let render = MixerRender {
@@ -832,8 +991,18 @@ fn open_output(
         format: (0, 0),
         made: Arc::clone(&made),
     };
-    let device = fastframe_audio::Output::open(output_options(preferred, buffer_ms), render)?;
+    let opening = Instant::now();
+    let device = fastframe_audio::Output::open(output_options(preferred, buffer_ms), render)
+        .inspect_err(|error| metrics::open_failed(error, opening.elapsed(), preferred))?;
+    crate::telemetry::private_term(device.device_name());
     log::info!("audio output: {}", device.device_name());
+    metrics::opened(
+        device.device_name(),
+        (device.sample_rate(), device.channels()),
+        opening.elapsed(),
+        preferred,
+        buffer_ms,
+    );
     // The open configured the renderer, which made the mixer.
     let (mixer, sample_rate) = made
         .lock()
@@ -856,6 +1025,1455 @@ fn open_output(
     };
     output.attach((mixer, sample_rate), control);
     Ok(output)
+}
+
+/// Measurements of the audio output for diagnostics (see the telemetry
+/// module).
+///
+/// The audio callback touches nothing here but relaxed atomics: counters,
+/// gauges and timestamps. Events are built on the player's, the backend's
+/// or the runtime's threads, and only while telemetry is on. Device names
+/// can carry a person's name, so only a guess at the route and a digest of
+/// the name leave the machine.
+pub mod metrics {
+    use std::sync::OnceLock;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64};
+    use std::time::{Duration, Instant};
+
+    use librespot_playback::SAMPLE_RATE;
+
+    use super::{Envelope, OpenError, Output, QUEUE_LIMIT, SCALE};
+    use crate::telemetry::{self, Counter, Gauge, Throttle};
+
+    // Reported by the heartbeat: counters as deltas, gauges as they stand
+    // or at their peak since the previous heartbeat.
+    static CB_CALLS: Counter = Counter::new("audio_cb_calls");
+    static CB_FRAMES: Counter = Counter::new("audio_cb_frames");
+    static CB_OVER_BUDGET: Counter = Counter::new("audio_cb_over_budget");
+    static CB_STALLS: Counter = Counter::new("audio_cb_stalls");
+    static UNDERRUN_FRAMES: Counter = Counter::new("audio_underrun_frames");
+    static UNDERRUN_CALLBACKS: Counter = Counter::new("audio_underrun_callbacks");
+    static NO_SOURCE_FRAMES: Counter = Counter::new("audio_no_source_frames");
+    static SILENT_CALLBACKS: Counter = Counter::new("audio_silent_callbacks");
+    static UNPLAYED_FRAMES: Counter = Counter::new("audio_unplayed_frames");
+    static WRITES: Counter = Counter::new("audio_writes");
+    static GATE_PACKETS: Counter = Counter::new("audio_gate_discarded_packets");
+    static GATE_FRAMES: Counter = Counter::new("audio_gate_discarded_frames");
+    static RAN_DRY: Counter = Counter::new("audio_ran_dry");
+    static WRITER_STALLS: Counter = Counter::new("audio_writer_stalls");
+    static OUTPUT_ERRORS: Counter = Counter::new("audio_output_errors");
+    static XRUNS: Counter = Counter::new("audio_xruns");
+    static REOPENS: Counter = Counter::new("audio_output_reopens");
+    static NONFINITE: Counter = Counter::new("audio_nonfinite_samples");
+    static LIMITER_POISONED: Counter = Counter::new("audio_limiter_poisoned");
+    static EQ_LOCK_WAITS: Counter = Counter::new("audio_eq_lock_waits");
+    static TAP_LOCK_WAITS: Counter = Counter::new("audio_tap_lock_waits");
+
+    static CB_MAX_US: Gauge = Gauge::peak("audio_cb_max_us");
+    static CB_MAX_GAP_US: Gauge = Gauge::peak("audio_cb_max_gap_us");
+    static OUT_PEAK: Gauge = Gauge::peak("audio_out_peak_milli");
+    static SIGNAL_PEAK: Gauge = Gauge::peak("audio_signal_peak_milli");
+    static WRITE_MAX_GAP_MS: Gauge = Gauge::peak("audio_write_max_gap_ms");
+    static PROCESS_MAX_US: Gauge = Gauge::peak("audio_process_max_us");
+    static PACKET_MAX_FRAMES: Gauge = Gauge::peak("audio_packet_max_frames");
+    static QUEUE_MAX_MS: Gauge = Gauge::peak("audio_queue_max_ms");
+    static QUEUE_MIN_MS: Gauge = Gauge::last("audio_queue_min_ms");
+    static LIMITER_REDUCTION: Gauge = Gauge::peak("audio_limiter_max_reduction_milli");
+
+    /// Adds the counters and gauges above to the heartbeat.
+    pub(super) fn register() {
+        telemetry::register_counters(&[
+            &CB_CALLS,
+            &CB_FRAMES,
+            &CB_OVER_BUDGET,
+            &CB_STALLS,
+            &UNDERRUN_FRAMES,
+            &UNDERRUN_CALLBACKS,
+            &NO_SOURCE_FRAMES,
+            &SILENT_CALLBACKS,
+            &UNPLAYED_FRAMES,
+            &WRITES,
+            &GATE_PACKETS,
+            &GATE_FRAMES,
+            &RAN_DRY,
+            &WRITER_STALLS,
+            &OUTPUT_ERRORS,
+            &XRUNS,
+            &REOPENS,
+            &NONFINITE,
+            &LIMITER_POISONED,
+            &EQ_LOCK_WAITS,
+            &TAP_LOCK_WAITS,
+        ]);
+        telemetry::register_gauges(&[
+            &CB_MAX_US,
+            &CB_MAX_GAP_US,
+            &OUT_PEAK,
+            &SIGNAL_PEAK,
+            &WRITE_MAX_GAP_MS,
+            &PROCESS_MAX_US,
+            &PACKET_MAX_FRAMES,
+            &QUEUE_MAX_MS,
+            &QUEUE_MIN_MS,
+            &LIMITER_REDUCTION,
+        ]);
+        telemetry::register_sampler(sample);
+    }
+
+    /// The device is expected to play queued sound: the sink was fed since
+    /// it last started, reset or stopped, and is not paused.
+    static EXPECT_AUDIO: AtomicBool = AtomicBool::new(false);
+    /// The interrupt gate is closed, so silence is intended, and since when.
+    static GATE_CLOSED: AtomicBool = AtomicBool::new(false);
+    static GATE_CLOSED_AT: AtomicU64 = AtomicU64::new(0);
+    static GATE_RELEASED_AT: AtomicU64 = AtomicU64::new(0);
+    /// Frames the closed gate has thrown away, at Spotify's rate.
+    static GATE_DISCARDED: AtomicU64 = AtomicU64::new(0);
+    static GATE_STUCK_REPORTED: AtomicU64 = AtomicU64::new(0);
+    /// Frames the queued chunks handed to the device.
+    static FRAMES_SUPPLIED: AtomicU64 = AtomicU64::new(0);
+    /// The last callback, and the current runs of starved frames and of
+    /// silent ones while sound was expected.
+    static CALLBACK_AT: AtomicU64 = AtomicU64::new(0);
+    static DRY_RUN: AtomicU64 = AtomicU64::new(0);
+    static SILENT_RUN: AtomicU64 = AtomicU64::new(0);
+    static DEVICE_PAUSED_AT: AtomicU64 = AtomicU64::new(0);
+    /// The rate the mixer runs at, to turn frames into time.
+    static OUTPUT_RATE: AtomicU32 = AtomicU32::new(0);
+    /// A traced change's first packet, waiting for the device to take it.
+    static FIRST_RENDER_PENDING: AtomicBool = AtomicBool::new(false);
+    static FIRST_RENDER_AT: AtomicU64 = AtomicU64::new(0);
+
+    // The writer's heartbeat: where the player's thread is, and when it
+    // last entered and left a write.
+    static FEEDING: AtomicBool = AtomicBool::new(false);
+    static WRITER_PHASE: AtomicU8 = AtomicU8::new(OUTSIDE);
+    static WRITE_ENTERED_AT: AtomicU64 = AtomicU64::new(0);
+    static WRITE_LEFT_AT: AtomicU64 = AtomicU64::new(0);
+    static WRITE_GAP: AtomicU64 = AtomicU64::new(0);
+    static LEFT_QUEUED_MS: AtomicU64 = AtomicU64::new(0);
+    static LEFT_UNDERRUN: AtomicU64 = AtomicU64::new(0);
+    static STUCK_REPORTED: AtomicU64 = AtomicU64::new(0);
+    static LOAD_STARTED_AT: AtomicU64 = AtomicU64::new(0);
+    static TRACK_CHANGED_AT: AtomicU64 = AtomicU64::new(0);
+    static SEEK_AT: AtomicU64 = AtomicU64::new(0);
+
+    /// Where the player's thread is. Outside a write it is in librespot:
+    /// decoding, waiting on the file, loading or handling a command.
+    pub(crate) const OUTSIDE: u8 = 0;
+    pub(crate) const PROCESS: u8 = 1;
+    pub(crate) const TAP: u8 = 2;
+    pub(crate) const OPEN: u8 = 3;
+    pub(crate) const QUEUE: u8 = 4;
+    pub(crate) const BACKPRESSURE: u8 = 5;
+    pub(crate) const GATE: u8 = 6;
+    pub(crate) const START: u8 = 7;
+    pub(crate) const STOP: u8 = 8;
+
+    /// Below this (-80 dBFS) sound counts as silence; above this (-40 dBFS)
+    /// a packet holds sound a listener would hear.
+    const SILENT: f32 = 1e-4;
+    const LOUD: f32 = 0.01;
+    /// Silence a listener notices, in milliseconds.
+    const NOTICEABLE_MS: f64 = 150.0;
+    /// The shortest gap between callbacks that counts as a stall.
+    const CALLBACK_STALL_NS: u64 = 50_000_000;
+    const WRITER_STALL: Duration = Duration::from_millis(100);
+    const INSIDE_STALL: Duration = Duration::from_millis(20);
+    /// How long a full queue may wait before the device counts as stalled.
+    pub(super) const OUTPUT_STALL: Duration = Duration::from_secs(1);
+    const GATE_STUCK: Duration = Duration::from_secs(5);
+    const WRITER_STUCK: Duration = Duration::from_secs(3);
+    /// How long after a seek or a load librespot may still wait on the file.
+    const SETTLE: Duration = Duration::from_secs(3);
+    const STATS_EVERY: Duration = Duration::from_secs(2);
+    const GAUGE_WINDOW: Duration = Duration::from_secs(30);
+
+    static DRY_EVENT: Throttle = Throttle::new();
+    static DRY_CRUMB: Throttle = Throttle::new();
+    static DRY_CAUSE: Throttle = Throttle::new();
+    static STARVED: Throttle = Throttle::new();
+    static SILENT_OUTPUT: Throttle = Throttle::new();
+    static STALL_EVENT: Throttle = Throttle::new();
+    static STALL_CRUMB: Throttle = Throttle::new();
+    static XRUN_CRUMB: Throttle = Throttle::new();
+    static XRUN_WARNING: Throttle = Throttle::new();
+    static ERROR_EVENT: Throttle = Throttle::new();
+    static WRITE_ERROR: Throttle = Throttle::new();
+    static DRAIN_TIMEOUT: Throttle = Throttle::new();
+    static OUTPUT_STALLED: Throttle = Throttle::new();
+    static INTERRUPT_DEADLINE: Throttle = Throttle::new();
+    static NONFINITE_ANOMALY: Throttle = Throttle::new();
+
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+    /// Starts the clock the timestamps here use. The audio callback only
+    /// reads it, so the output starts it before opening a stream.
+    pub(super) fn start_clock() {
+        let _ = EPOCH.get_or_init(Instant::now);
+    }
+
+    /// Nanoseconds on that clock; never 0, which stands for "never".
+    fn now_ns() -> u64 {
+        let epoch = *EPOCH.get_or_init(Instant::now);
+        (epoch.elapsed().as_nanos() as u64).max(1)
+    }
+
+    /// `at` on the same clock without starting it, for the callback.
+    fn at_ns(at: Instant) -> u64 {
+        EPOCH.get().map_or(0, |epoch| {
+            (at.saturating_duration_since(*epoch).as_nanos() as u64).max(1)
+        })
+    }
+
+    fn since_ns(at: u64) -> Duration {
+        Duration::from_nanos(now_ns().saturating_sub(at))
+    }
+
+    /// Milliseconds since `at`, or nothing when it never happened.
+    fn age_ms(at: u64) -> Option<f64> {
+        (at != 0).then(|| telemetry::duration_ms(since_ns(at)))
+    }
+
+    /// Whether `at` happened within `window`.
+    fn recent(at: u64, window: Duration) -> bool {
+        at != 0 && since_ns(at) < window
+    }
+
+    /// Milliseconds since the device last asked for sound.
+    pub(super) fn callback_age_ms() -> Option<f64> {
+        age_ms(CALLBACK_AT.load(Relaxed))
+    }
+
+    /// How long `frames` last at `rate`, in milliseconds.
+    pub(super) fn frames_ms(frames: u64, rate: u32) -> f64 {
+        if rate == 0 {
+            0.0
+        } else {
+            frames as f64 * 1_000.0 / f64::from(rate)
+        }
+    }
+
+    fn tenth(value: f64) -> f64 {
+        (value * 10.0).round() / 10.0
+    }
+
+    // The audio callback.
+
+    /// Taken by the callback before it renders.
+    #[inline]
+    pub(super) fn callback_began() -> (Instant, u64) {
+        (Instant::now(), FRAMES_SUPPLIED.load(Relaxed))
+    }
+
+    /// Counts a callback that rendered `samples` at `format`, `missing` of
+    /// them with no source, `peak` being the loudest before volume. Relaxed
+    /// atomics only: this runs on the audio thread.
+    pub(super) fn callback_ended(
+        (began, supplied_before): (Instant, u64),
+        samples: usize,
+        (rate, channels): (u32, u16),
+        missing: usize,
+        peak: f32,
+    ) {
+        let channels = usize::from(channels).max(1);
+        let frames = (samples / channels) as u64;
+        let supplied = FRAMES_SUPPLIED.load(Relaxed).wrapping_sub(supplied_before);
+        let ended = Instant::now();
+        let took = ended.saturating_duration_since(began);
+        CB_CALLS.incr();
+        CB_FRAMES.add(frames);
+        CB_MAX_US.raise(took.as_micros() as i64);
+        let period = if rate == 0 {
+            0
+        } else {
+            frames * 1_000_000_000 / u64::from(rate)
+        };
+        if rate != 0 && took.as_nanos() as u64 > period {
+            CB_OVER_BUDGET.incr();
+        }
+        OUT_PEAK.raise((peak * 1_000.0) as i64);
+        let at = at_ns(ended);
+        let last = CALLBACK_AT.swap(at, Relaxed);
+        if !EXPECT_AUDIO.load(Relaxed) || GATE_CLOSED.load(Relaxed) {
+            DRY_RUN.store(0, Relaxed);
+            SILENT_RUN.store(0, Relaxed);
+            return;
+        }
+        if last != 0 && at > last {
+            let gap = at - last;
+            CB_MAX_GAP_US.raise((gap / 1_000) as i64);
+            if gap > CALLBACK_STALL_NS.max(period * 3) {
+                CB_STALLS.incr();
+            }
+        }
+        if missing > 0 {
+            NO_SOURCE_FRAMES.add((missing / channels) as u64);
+        }
+        // rodio pads an empty queue with silence, so starvation shows only
+        // as frames the queue's chunks did not supply.
+        let short = frames.saturating_sub(supplied);
+        if short > 0 {
+            UNDERRUN_FRAMES.add(short);
+            UNDERRUN_CALLBACKS.incr();
+            DRY_RUN.fetch_add(short, Relaxed);
+        } else {
+            DRY_RUN.store(0, Relaxed);
+        }
+        if supplied > 0 {
+            if peak < SILENT {
+                SILENT_CALLBACKS.incr();
+                SILENT_RUN.fetch_add(supplied, Relaxed);
+            } else {
+                SILENT_RUN.store(0, Relaxed);
+            }
+            if FIRST_RENDER_PENDING.load(Relaxed) && FIRST_RENDER_PENDING.swap(false, Relaxed) {
+                FIRST_RENDER_AT.store(at, Relaxed);
+            }
+        }
+    }
+
+    /// One frame of a queued chunk went to the device.
+    #[inline]
+    pub(super) fn frame_supplied() {
+        FRAMES_SUPPLIED.fetch_add(1, Relaxed);
+    }
+
+    /// A chunk was dropped with `frames` unplayed: a skip, a seek or a new
+    /// stream format threw it away.
+    #[inline]
+    pub(super) fn unplayed(frames: u32) {
+        if frames > 0 {
+            UNPLAYED_FRAMES.add(u64::from(frames));
+        }
+    }
+
+    // The device.
+
+    /// The device stopped asking for sound.
+    pub(super) fn device_paused() {
+        CALLBACK_AT.store(0, Relaxed);
+        DEVICE_PAUSED_AT.store(now_ns(), Relaxed);
+    }
+
+    /// The device is about to ask for sound again. Its next callback starts
+    /// afresh rather than closing a gap as long as the pause.
+    pub(super) fn device_resuming() {
+        CALLBACK_AT.store(0, Relaxed);
+        let paused_at = DEVICE_PAUSED_AT.swap(0, Relaxed);
+        telemetry::crumb("audio.device.resumed")
+            .field("paused_ms", age_ms(paused_at))
+            .emit();
+    }
+
+    /// The output opened `device` at `format` in `took`.
+    pub(super) fn opened(
+        device: &str,
+        (sample_rate, channels): (u32, u16),
+        took: Duration,
+        preferred: Option<&str>,
+        buffer_ms: u32,
+    ) {
+        note_route(device, sample_rate);
+        if !telemetry::enabled() {
+            return;
+        }
+        let named = preferred.map(str::trim).filter(|name| !name.is_empty());
+        telemetry::event("audio.output.open")
+            .ms("open_ms", took)
+            .field("route", route(device))
+            .field("device_digest", telemetry::digest(device))
+            .field("named_device", named.is_some())
+            .field("named_missing", named.is_some_and(|name| name != device))
+            .field("sample_rate", sample_rate)
+            .field("channels", channels)
+            .field("requested_rate", SAMPLE_RATE)
+            .field("resampling", sample_rate != SAMPLE_RATE)
+            .field("buffer", if cfg!(windows) { "fixed" } else { "driver" })
+            .field("buffer_ms", cfg!(windows).then_some(buffer_ms))
+            .field("thread_qos", thread_qos())
+            .emit();
+    }
+
+    /// Opening the output failed after `took`.
+    pub(super) fn open_failed(
+        error: &fastframe_audio::OpenError,
+        took: Duration,
+        preferred: Option<&str>,
+    ) {
+        if !telemetry::enabled() {
+            return;
+        }
+        telemetry::crumb("audio.output.open_failed")
+            .ms("open_ms", took)
+            .field(
+                "no_device",
+                matches!(error, fastframe_audio::OpenError::NoDevice),
+            )
+            .text("error", &error.to_string())
+            .field(
+                "named_device",
+                preferred.is_some_and(|name| !name.trim().is_empty()),
+            )
+            .emit();
+    }
+
+    /// The output opened its stream again, on `device` at `format`, in
+    /// `took`; the mixer ran at `previous_rate` before.
+    pub(super) fn reopened(
+        device: &str,
+        (sample_rate, channels): (u32, u16),
+        reason: fastframe_audio::Reason,
+        took: Duration,
+        previous_rate: u32,
+    ) {
+        REOPENS.incr();
+        note_route(device, sample_rate);
+        if !telemetry::enabled() {
+            return;
+        }
+        let reason = match reason {
+            fastframe_audio::Reason::Failed => "failed",
+            fastframe_audio::Reason::DefaultChanged => "default_changed",
+            fastframe_audio::Reason::Resumed => "resumed",
+        };
+        let class = route(device);
+        telemetry::note_cause("sink:reopen", reason);
+        if reason == "default_changed" {
+            telemetry::note_cause("sink:route_change", class);
+        }
+        telemetry::event("audio.output.reopened")
+            .field("reason", reason)
+            .field("route", class)
+            .field("device_digest", telemetry::digest(device))
+            .field("sample_rate", sample_rate)
+            .field("channels", channels)
+            .field("rate_changed", sample_rate != previous_rate)
+            .ms("open_ms", took)
+            .emit();
+    }
+
+    /// The output could not open its stream again; the write fails next.
+    pub(super) fn reopen_failed(error: &fastframe_audio::OpenError, took: Duration) {
+        if !telemetry::enabled() {
+            return;
+        }
+        telemetry::event("audio.output.reopen_failed")
+            .ms("open_ms", took)
+            .field(
+                "no_device",
+                matches!(error, fastframe_audio::OpenError::NoDevice),
+            )
+            .text("error", &error.to_string())
+            .emit();
+    }
+
+    /// The output let its device go.
+    pub(super) fn released() {
+        telemetry::crumb("audio.output.released").emit();
+    }
+
+    /// The stream now runs at another rate: a new mixer took over, and the
+    /// queue went with the old one.
+    pub(super) fn format_changed(
+        device: &str,
+        from_rate: u32,
+        to_rate: u32,
+        dropped: u64,
+        resampling: bool,
+    ) {
+        note_route(device, to_rate);
+        if !telemetry::enabled() {
+            return;
+        }
+        telemetry::event("audio.output.format_changed")
+            .field("from_rate", from_rate)
+            .field("to_rate", to_rate)
+            .field("dropped_ms", tenth(frames_ms(dropped, from_rate)))
+            .field("resampling", resampling)
+            .emit();
+    }
+
+    /// Counts and reports an error the device reported, and returns its
+    /// class.
+    pub(super) fn output_error(error: &fastframe_audio::OutputError) -> &'static str {
+        OUTPUT_ERRORS.incr();
+        let message = error.to_string();
+        let class = error_class(&message);
+        if class == "xrun" {
+            XRUNS.incr();
+            if XRUN_CRUMB.ready(Duration::from_secs(1)) {
+                telemetry::crumb("audio.output.xrun").emit();
+            }
+            return class;
+        }
+        if matches!(
+            class,
+            "route_changed" | "device_gone" | "no_default" | "rate_changed"
+        ) {
+            telemetry::note_cause("sink:route_change", class);
+        }
+        if ERROR_EVENT.ready(Duration::from_millis(200)) {
+            telemetry::event("audio.output.error")
+                .field("class", class)
+                .field("fatal", error.is_fatal())
+                .text("message", &message)
+                .emit();
+        }
+        class
+    }
+
+    /// Whether an xrun is logged as a warning. Warnings ship while telemetry
+    /// is on, so then at most one a second; the counter keeps the rest.
+    pub(super) fn xrun_warning_due() -> bool {
+        !telemetry::enabled() || XRUN_WARNING.ready(Duration::from_secs(1))
+    }
+
+    /// What an error from the device is about, from cpal's fixed messages.
+    fn error_class(message: &str) -> &'static str {
+        let message = message.to_lowercase();
+        if mentions(&message, &["underrun", "overrun"]) {
+            "xrun"
+        } else if mentions(&message, &["no default output"]) {
+            "no_default"
+        } else if mentions(&message, &["route changed", "device changed"]) {
+            "route_changed"
+        } else if mentions(&message, &["sample rate"]) {
+            "rate_changed"
+        } else if mentions(&message, &["disconnected", "not available"]) {
+            "device_gone"
+        } else if mentions(&message, &["real-time", "realtime"]) {
+            "realtime_denied"
+        } else if mentions(&message, &["permission"]) {
+            "permission"
+        } else if mentions(&message, &["busy"]) {
+            "busy"
+        } else if mentions(&message, &["no longer valid", "invalidated", "rebuilt"]) {
+            "invalidated"
+        } else {
+            "other"
+        }
+    }
+
+    /// A guess at where the sound goes, from the device's name.
+    pub(crate) fn route(device: &str) -> &'static str {
+        let name = device.to_lowercase();
+        if mentions(
+            &name,
+            &[
+                "blackhole",
+                "loopback",
+                "soundflower",
+                "virtual",
+                "vb-audio",
+                "voicemeeter",
+                "aggregate",
+                "multi-output",
+                "zoomaudio",
+                "teams audio",
+                "krisp",
+            ],
+        ) {
+            "virtual"
+        } else if mentions(&name, &["airplay", "apple tv", "homepod"]) {
+            "airplay"
+        } else if mentions(
+            &name,
+            &[
+                "airpods",
+                "beats",
+                "bluetooth",
+                "hands-free",
+                "handsfree",
+                "bose",
+                "jabra",
+                "buds",
+                "wh-1000",
+                "wf-1000",
+                "jbl",
+                "marshall",
+            ],
+        ) {
+            "bluetooth"
+        } else if mentions(
+            &name,
+            &[
+                "hdmi",
+                "displayport",
+                "display audio",
+                "nvidia",
+                "amd high definition",
+            ],
+        ) {
+            "hdmi"
+        } else if mentions(
+            &name,
+            &[
+                "usb",
+                "dac",
+                "scarlett",
+                "focusrite",
+                "motu",
+                "audient",
+                "behringer",
+                "fiio",
+                "schiit",
+                "apogee",
+                "steinberg",
+                "universal audio",
+                "studio display",
+            ],
+        ) {
+            "usb"
+        } else if mentions(
+            &name,
+            &[
+                "macbook",
+                "imac",
+                "mac mini",
+                "mac studio",
+                "mac pro",
+                "built-in",
+                "internal",
+                "realtek",
+                "conexant",
+                "headphones",
+                "speakers",
+            ],
+        ) {
+            "builtin"
+        } else {
+            "unknown"
+        }
+    }
+
+    fn mentions(text: &str, words: &[&str]) -> bool {
+        words.iter().any(|word| text.contains(*word))
+    }
+
+    /// Keeps the output's rate, and puts its route and rate on every later
+    /// event.
+    fn note_route(device: &str, sample_rate: u32) {
+        OUTPUT_RATE.store(sample_rate, Relaxed);
+        if telemetry::enabled() {
+            telemetry::set_context("output_route", route(device));
+            telemetry::set_context("output_rate", sample_rate);
+        }
+    }
+
+    /// The calling thread's QoS class. On Apple silicon a thread below
+    /// user-initiated can be kept to the efficiency cores, which is enough
+    /// to starve the output under load.
+    #[cfg(target_os = "macos")]
+    fn thread_qos() -> Option<&'static str> {
+        let mut class: u32 = 0;
+        let mut priority: libc::c_int = 0;
+        // SAFETY: the call writes a `qos_class_t`, a C enum the size of a
+        // u32, into `class`, which is only ever read as a u32, and an int
+        // into `priority`.
+        let status = unsafe {
+            libc::pthread_get_qos_class_np(
+                libc::pthread_self(),
+                (&raw mut class).cast::<libc::qos_class_t>(),
+                &raw mut priority,
+            )
+        };
+        (status == 0).then_some(match class {
+            0x21 => "user_interactive",
+            0x19 => "user_initiated",
+            0x15 => "default",
+            0x11 => "utility",
+            0x09 => "background",
+            0x05 => "maintenance",
+            0x00 => "unspecified",
+            _ => "other",
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn thread_qos() -> Option<&'static str> {
+        None
+    }
+
+    // The sink.
+
+    /// `start` brought the sink up in `took`, opening the device when
+    /// `opened`, or could not open it.
+    pub(super) fn sink_started(
+        took: Duration,
+        opened: bool,
+        was_paused: Option<bool>,
+        error: Option<&OpenError>,
+    ) {
+        if !telemetry::enabled() {
+            return;
+        }
+        let mut record = telemetry::crumb("audio.sink.start")
+            .ms("start_ms", took)
+            .field("opened", opened)
+            .field("device_was_paused", was_paused)
+            .field("thread_qos", thread_qos());
+        if let Some(error) = error {
+            record = record.text("open_error", &error.to_string());
+        }
+        record.emit();
+    }
+
+    /// Silence from here is intended: playback paused or stopped.
+    pub(super) fn stopping() {
+        EXPECT_AUDIO.store(false, Relaxed);
+    }
+
+    /// How `stop` played the queue out.
+    pub(super) struct Drain {
+        pub(super) queued_ms: f64,
+        pub(super) took: Duration,
+        pub(super) drained: bool,
+        pub(super) failed: bool,
+        pub(super) callback_age_ms: Option<f64>,
+    }
+
+    /// `stop` drained the queue, then paused the device in `pause_took`.
+    /// librespot reports Paused only after this returns.
+    pub(super) fn sink_stopped(drain: Drain, pause_took: Duration) {
+        if !telemetry::enabled() {
+            return;
+        }
+        // A drain that neither emptied nor failed waited out its deadline:
+        // the device had stopped taking sound.
+        let timed_out = !drain.drained && !drain.failed;
+        let record = if timed_out && DRAIN_TIMEOUT.ready(Duration::from_secs(60)) {
+            telemetry::anomaly("audio.sink.drain_timeout")
+        } else {
+            telemetry::crumb("audio.sink.stop")
+        };
+        record
+            .field("queued_ms", tenth(drain.queued_ms))
+            .ms("drain_ms", drain.took)
+            .ms("pause_ms", pause_took)
+            .field("timed_out", timed_out)
+            .field("output_failed", drain.failed)
+            .field("callback_age_ms", drain.callback_age_ms)
+            .emit();
+    }
+
+    /// A fresh queue after a skip or a seek.
+    pub(super) fn sink_reset(sample_rate: u32, resampling: bool) {
+        if !telemetry::enabled() {
+            return;
+        }
+        // How long the new track's first packet took after the gate opened.
+        let since_release = age_ms(GATE_RELEASED_AT.load(Relaxed)).filter(|ms| *ms < 10_000.0);
+        telemetry::crumb("audio.sink.reset")
+            .field("since_release_ms", since_release)
+            .field("sample_rate", sample_rate)
+            .field("resampling", resampling)
+            .emit();
+    }
+
+    /// A write failed, which makes librespot pause: the output failed, or
+    /// could not be opened.
+    pub(super) fn write_error(
+        reason: &'static str,
+        error: &str,
+        output_errors: &[&'static str],
+        queued_ms: Option<f64>,
+        named_device: bool,
+    ) {
+        telemetry::note_cause("sink:write_error", reason);
+        if !telemetry::enabled() {
+            return;
+        }
+        let record = if WRITE_ERROR.ready(Duration::from_secs(10)) {
+            telemetry::anomaly("audio.sink.write_error")
+        } else {
+            telemetry::event("audio.sink.write_error")
+        };
+        record
+            .field("reason", reason)
+            .text("error", error)
+            .field("output_errors", output_errors.to_vec())
+            .field("queued_ms", queued_ms.map(tenth))
+            .field("named_device", named_device)
+            .field("callback_age_ms", callback_age_ms())
+            .emit();
+    }
+
+    /// The queue stayed full for `waited`: the device stopped taking sound
+    /// without reporting a failure, and librespot is held in this write.
+    pub(super) fn output_stalled(waited: Duration, output: &Output) {
+        if !OUTPUT_STALLED.ready(Duration::from_secs(30)) {
+            return;
+        }
+        telemetry::anomaly("audio.output_stalled")
+            .ms("waited_ms", waited)
+            .field("queued_chunks", output.sink.len())
+            .field("callback_age_ms", callback_age_ms())
+            .field("device_paused", output.device.is_paused())
+            .field("sink_paused", output.sink.is_paused())
+            .field("sample_rate", output.sample_rate)
+            .emit();
+    }
+
+    /// The write queued its packet and found room: what is queued now is
+    /// the cushion until librespot writes again.
+    pub(super) fn write_done(output: &Output) {
+        LEFT_QUEUED_MS.store(
+            frames_ms(output.queued.frames(), output.sample_rate) as u64,
+            Relaxed,
+        );
+    }
+
+    /// The loudest sample of a packet the sink queues.
+    pub(super) fn peak(samples: &[f32]) -> f32 {
+        samples
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()))
+    }
+
+    // The interrupt gate.
+
+    /// The interrupt gate closed: silence from here is intended.
+    pub(super) fn gate_closed() -> Instant {
+        GATE_CLOSED.store(true, Relaxed);
+        EXPECT_AUDIO.store(false, Relaxed);
+        GATE_CLOSED_AT.store(now_ns(), Relaxed);
+        GATE_DISCARDED.store(0, Relaxed);
+        Instant::now()
+    }
+
+    /// `interrupt` faded the old track out from `began`. `fade` holds the
+    /// chunks queued then and whether the fade reached silence, when there
+    /// was a sink to fade.
+    pub(super) fn interrupted(began: Instant, fade: Option<(usize, bool)>, buffer_ms: u32) {
+        if !telemetry::enabled() {
+            return;
+        }
+        // The fade is clocked by the device, so one that never finished
+        // means the device stopped asking for sound, and the skip waited
+        // out the whole deadline before reaching Connect.
+        let hit_deadline = fade.is_some_and(|(_, silent)| !silent);
+        let record = if hit_deadline && INTERRUPT_DEADLINE.ready(Duration::from_secs(60)) {
+            telemetry::anomaly("audio.interrupt_deadline")
+        } else {
+            telemetry::crumb("audio.interrupt")
+        };
+        record
+            .since("fade_ms", began)
+            .field("had_sink", fade.is_some())
+            .field("queued_chunks", fade.map(|(chunks, _)| chunks))
+            .field("hit_deadline", hit_deadline)
+            .field("buffer_ms", buffer_ms)
+            .field("callback_age_ms", callback_age_ms())
+            .emit();
+    }
+
+    /// `interrupt` found the gate already closed: another skip in a row.
+    pub(super) fn interrupt_repeated() {
+        telemetry::crumb("audio.interrupt")
+            .field("already_waiting", true)
+            .field("gate_ms", age_ms(GATE_CLOSED_AT.load(Relaxed)))
+            .emit();
+    }
+
+    /// The gate opened; `by` says what released it.
+    pub(super) fn gate_released(by: &'static str) {
+        GATE_CLOSED.store(false, Relaxed);
+        EXPECT_AUDIO.store(false, Relaxed);
+        GATE_RELEASED_AT.store(now_ns(), Relaxed);
+        let closed_at = GATE_CLOSED_AT.swap(0, Relaxed);
+        if closed_at == 0 || !telemetry::enabled() {
+            return;
+        }
+        // A crumb: the player ships `player.gate` for the same opening.
+        telemetry::crumb("audio.gate")
+            .field("released_by", by)
+            .ms("gate_ms", since_ns(closed_at))
+            .field(
+                "discarded_ms",
+                tenth(frames_ms(GATE_DISCARDED.load(Relaxed), SAMPLE_RATE)),
+            )
+            .field("load_seen", LOAD_STARTED_AT.load(Relaxed) > closed_at)
+            .emit();
+    }
+
+    /// The closed gate threw a packet of `frames` away.
+    pub(super) fn gated(frames: usize) {
+        GATE_PACKETS.incr();
+        GATE_FRAMES.add(frames as u64);
+        GATE_DISCARDED.fetch_add(frames as u64, Relaxed);
+        check_gate();
+    }
+
+    /// Reports a gate closed far longer than a load takes: the song plays
+    /// on, unheard.
+    fn check_gate() {
+        let closed_at = GATE_CLOSED_AT.load(Relaxed);
+        if closed_at == 0 || !GATE_CLOSED.load(Relaxed) || !telemetry::enabled() {
+            return;
+        }
+        let closed_for = since_ns(closed_at);
+        if closed_for < GATE_STUCK || GATE_STUCK_REPORTED.swap(closed_at, Relaxed) == closed_at {
+            return;
+        }
+        telemetry::anomaly("audio.gate_stuck")
+            .ms("gate_ms", closed_for)
+            .field(
+                "discarded_ms",
+                tenth(frames_ms(GATE_DISCARDED.load(Relaxed), SAMPLE_RATE)),
+            )
+            .field("load_seen", LOAD_STARTED_AT.load(Relaxed) > closed_at)
+            .emit();
+    }
+
+    /// A confirmed seek dropped `chunks` of queued sound.
+    pub(super) fn seek_cut(chunks: usize) {
+        EXPECT_AUDIO.store(false, Relaxed);
+        telemetry::crumb("audio.seek_cut")
+            .field("chunks_dropped", chunks)
+            .emit();
+    }
+
+    /// librespot finished a seek, from this or another device.
+    pub(super) fn seeked() {
+        SEEK_AT.store(now_ns(), Relaxed);
+    }
+
+    /// librespot started loading a track.
+    pub(super) fn loading() {
+        LOAD_STARTED_AT.store(now_ns(), Relaxed);
+    }
+
+    /// librespot moved on to another track.
+    pub(super) fn track_changed() {
+        TRACK_CHANGED_AT.store(now_ns(), Relaxed);
+    }
+
+    /// A new engine's control: whatever an earlier one left closed is gone.
+    pub(super) fn control_created() {
+        GATE_CLOSED.store(false, Relaxed);
+        GATE_CLOSED_AT.store(0, Relaxed);
+        EXPECT_AUDIO.store(false, Relaxed);
+    }
+
+    // The player's thread.
+
+    /// Records where the player's thread is.
+    pub(crate) fn phase(phase: u8) {
+        WRITER_PHASE.store(phase, Relaxed);
+    }
+
+    fn phase_name(phase: u8) -> &'static str {
+        match phase {
+            OUTSIDE => "librespot",
+            PROCESS => "process",
+            TAP => "tap",
+            OPEN => "output",
+            QUEUE => "queue",
+            BACKPRESSURE => "backpressure",
+            GATE => "gate",
+            START => "start",
+            STOP => "stop",
+            _ => "unknown",
+        }
+    }
+
+    /// Between `start` and `stop` librespot should keep writing, and a gap
+    /// across either is no stall.
+    pub(crate) fn feeding(on: bool) {
+        FEEDING.store(on, Relaxed);
+        WRITE_LEFT_AT.store(0, Relaxed);
+        if on && telemetry::enabled() {
+            // `start` itself is timed from here, not from the last write.
+            WRITE_ENTERED_AT.store(now_ns(), Relaxed);
+        }
+    }
+
+    /// The player's thread entered a write. Reports librespot keeping it
+    /// away for long since the last one, and returns when, while telemetry
+    /// is on.
+    pub(crate) fn write_began() -> Option<Instant> {
+        WRITER_PHASE.store(PROCESS, Relaxed);
+        if !telemetry::enabled() {
+            return None;
+        }
+        let entered = now_ns();
+        WRITE_ENTERED_AT.store(entered, Relaxed);
+        let left = WRITE_LEFT_AT.load(Relaxed);
+        let mut gap = Duration::ZERO;
+        if left != 0 && FEEDING.load(Relaxed) {
+            gap = Duration::from_nanos(entered.saturating_sub(left));
+            WRITE_MAX_GAP_MS.raise(gap.as_millis() as i64);
+            if gap >= WRITER_STALL {
+                librespot_stall(gap, left);
+            }
+        }
+        WRITE_GAP.store(gap.as_nanos() as u64, Relaxed);
+        Some(Instant::now())
+    }
+
+    /// Whether a seek is open here or another device asked for one within
+    /// `window`. Takes telemetry's locks, so only once a gap is long.
+    fn seek_asked(window: Duration) -> bool {
+        telemetry::trace_open("seek")
+            || telemetry::recent_causes(window)
+                .iter()
+                .any(|cause| cause.kind == "connect:request" && cause.detail == "seek_to")
+    }
+
+    /// librespot kept the player's thread for `gap` since it `left` the
+    /// last write: decoding, waiting on the file, loading or a command.
+    fn librespot_stall(gap: Duration, left: u64) {
+        let loading = LOAD_STARTED_AT.load(Relaxed) > left;
+        let gated = GATE_CLOSED.load(Relaxed);
+        let silence_ms = frames_ms(
+            UNDERRUN_FRAMES
+                .get()
+                .saturating_sub(LEFT_UNDERRUN.load(Relaxed)),
+            OUTPUT_RATE.load(Relaxed),
+        );
+        // A load or a closed gate keeps librespot away on purpose. A seek
+        // blocks it until the new position downloads, and the first writes
+        // after a seek or a load can still wait on the file.
+        let settling = !loading
+            && !gated
+            && (recent(SEEK_AT.load(Relaxed), SETTLE)
+                || recent(LOAD_STARTED_AT.load(Relaxed), SETTLE)
+                || seek_asked(gap.saturating_add(SETTLE)));
+        let expected = loading || gated || settling;
+        if !expected {
+            WRITER_STALLS.incr();
+        }
+        let ship = !expected
+            && (silence_ms > 0.0 || gap >= Duration::from_millis(500))
+            && STALL_EVENT.ready(Duration::from_secs(2));
+        let record = if ship {
+            telemetry::event("audio.writer_stall")
+        } else {
+            telemetry::crumb("audio.writer_stall")
+        };
+        record
+            .ms("gap_ms", gap)
+            .field("phase", phase_name(OUTSIDE))
+            .field("loading", loading)
+            .field("gated", gated)
+            .field("settling", settling)
+            .field("cushion_ms", LEFT_QUEUED_MS.load(Relaxed))
+            .field("silence_ms", tenth(silence_ms))
+            .emit();
+    }
+
+    /// One of our own steps held the player's thread for `took`.
+    pub(crate) fn inside(phase: u8, took: Duration) {
+        if took < INSIDE_STALL || !telemetry::enabled() {
+            return;
+        }
+        let record =
+            if took >= Duration::from_millis(250) && STALL_EVENT.ready(Duration::from_secs(2)) {
+                telemetry::event("audio.writer_stall")
+            } else if STALL_CRUMB.ready(Duration::from_millis(200)) {
+                telemetry::crumb("audio.writer_stall")
+            } else {
+                return;
+            };
+        record
+            .ms("gap_ms", took)
+            .field("phase", phase_name(phase))
+            .emit();
+    }
+
+    /// The player's thread is leaving a write.
+    pub(crate) fn write_ended() {
+        WRITER_PHASE.store(OUTSIDE, Relaxed);
+        if telemetry::enabled() {
+            WRITE_LEFT_AT.store(now_ns(), Relaxed);
+            LEFT_UNDERRUN.store(UNDERRUN_FRAMES.get(), Relaxed);
+        }
+    }
+
+    /// The loudest finite sample, and how many were NaN or infinite.
+    pub(crate) fn level(samples: &[f64]) -> (f64, u64) {
+        let mut peak = 0.0f64;
+        let mut nonfinite = 0;
+        for sample in samples {
+            if sample.is_finite() {
+                peak = peak.max(sample.abs());
+            } else {
+                nonfinite += 1;
+            }
+        }
+        (peak, nonfinite)
+    }
+
+    /// The equalizer and limiter stage shaped a packet of `frames` in
+    /// `took`. `level` describes it after the equalizer and before volume;
+    /// `limiter_gain` is the limiter's gain after it, when it ran.
+    pub(crate) fn shaped(
+        took: Duration,
+        frames: usize,
+        (peak, nonfinite): (f64, u64),
+        limiter_gain: Option<f64>,
+        eq_on: bool,
+    ) {
+        PROCESS_MAX_US.raise(took.as_micros() as i64);
+        PACKET_MAX_FRAMES.raise(frames as i64);
+        SIGNAL_PEAK.raise((peak * 1_000.0) as i64);
+        if let Some(gain) = limiter_gain
+            && gain.is_finite()
+        {
+            LIMITER_REDUCTION.raise(((1.0 - gain) * 1_000.0) as i64);
+        }
+        // One NaN poisons the limiter's running gain, and with it every
+        // sample after, until a skip or a seek rebuilds it.
+        let poisoned = limiter_gain.is_some_and(|gain| !gain.is_finite());
+        NONFINITE.add(nonfinite);
+        if poisoned {
+            LIMITER_POISONED.incr();
+        }
+        if (nonfinite > 0 || poisoned) && NONFINITE_ANOMALY.ready(Duration::from_secs(60)) {
+            telemetry::anomaly("audio.nonfinite_samples")
+                .field("count", nonfinite)
+                .field("limiter_poisoned", poisoned)
+                .field("eq_on", eq_on)
+                .field("packet_frames", frames)
+                .emit();
+        }
+        inside(PROCESS, took);
+    }
+
+    /// The equalizer's settings were locked, by the interface, when the
+    /// player's thread wanted them.
+    pub(crate) fn eq_lock_waited() {
+        EQ_LOCK_WAITS.incr();
+    }
+
+    /// The visualisers' buffer was locked when the player's thread wanted
+    /// it.
+    pub(crate) fn tap_lock_waited() {
+        TAP_LOCK_WAITS.incr();
+    }
+
+    /// The step each traced change waits for before its first sound counts.
+    const FIRST_AUDIO_AFTER: [(&str, &str); 7] = [
+        ("next", "track_changed"),
+        ("previous", "track_changed"),
+        // Previous a few seconds into a song rewinds it instead.
+        ("previous", "seeked"),
+        ("play", "track_changed"),
+        ("resume", "playing"),
+        ("transfer", "playing"),
+        ("seek", "seeked"),
+    ];
+
+    /// Ends each open trace this packet completes: the first sound accepted
+    /// for output after the step it waits for. `Tapped` calls it for
+    /// librespot's own sinks, which have no `Writer`.
+    pub(crate) fn first_audio() -> Option<&'static str> {
+        let mut ended = None;
+        for (trace, after) in FIRST_AUDIO_AFTER {
+            if telemetry::trace_has(trace, after) {
+                telemetry::trace_mark(trace, "first_audio");
+                telemetry::trace_end(trace, "ok");
+                ended = Some(trace);
+            }
+        }
+        ended
+    }
+
+    /// Reports what the write path cannot while it is stuck itself: the
+    /// player's thread gone for seconds while it should be writing, or an
+    /// interrupt gate that never opened. `register` hands it to telemetry's
+    /// watch thread, which runs it about once a second. Atomics only, until
+    /// the writer has been away for seconds.
+    pub fn sample() {
+        if !telemetry::enabled() {
+            return;
+        }
+        check_gate();
+        let phase = WRITER_PHASE.load(Relaxed);
+        // A full queue that will not drain is reported by the write itself.
+        if !FEEDING.load(Relaxed) || phase == BACKPRESSURE {
+            return;
+        }
+        let left = WRITE_LEFT_AT.load(Relaxed);
+        let since = if phase == OUTSIDE {
+            left
+        } else {
+            WRITE_ENTERED_AT.load(Relaxed)
+        };
+        if since == 0 {
+            return;
+        }
+        let stuck = since_ns(since);
+        let loading = LOAD_STARTED_AT.load(Relaxed) > left;
+        // A seek into sound not yet downloaded waits on the network, and its
+        // trace reports it if it takes too long.
+        if stuck < WRITER_STUCK
+            || (phase == OUTSIDE && (loading || seek_asked(stuck.saturating_add(SETTLE))))
+            || STUCK_REPORTED.swap(since, Relaxed) == since
+        {
+            return;
+        }
+        telemetry::anomaly("audio.writer_stuck")
+            .ms("stuck_ms", stuck)
+            .field("phase", phase_name(phase))
+            .field("gated", GATE_CLOSED.load(Relaxed))
+            .field(
+                "dry_ms",
+                tenth(frames_ms(DRY_RUN.load(Relaxed), OUTPUT_RATE.load(Relaxed))),
+            )
+            .field("callback_age_ms", callback_age_ms())
+            .emit();
+    }
+
+    /// What the player's thread remembers between writes.
+    #[derive(Default)]
+    pub(super) struct Writer {
+        /// When a packet last went out quieter than `LOUD`, and since when
+        /// packets have been digitally silent.
+        quiet_at: Option<Instant>,
+        silent_since: Option<Instant>,
+        /// The underrun count at the last packet.
+        underrun_seen: u64,
+        /// The last stats crumb, and the shortest queue, the device's clock
+        /// and the underrun count since.
+        stats_at: Option<Instant>,
+        stats_min_ms: Option<f64>,
+        stats_played: Duration,
+        stats_underrun: u64,
+        /// The heartbeat gauge's window, and the shortest queue in it.
+        window_at: Option<Instant>,
+        window_min_ms: Option<f64>,
+        /// A traced change's first packet: the trace, when it was queued,
+        /// and how much sound was queued ahead of it.
+        first: Option<(&'static str, u64, f64)>,
+    }
+
+    impl Writer {
+        /// Playback started or a new queue began: nothing heard yet.
+        pub(super) fn restart(&mut self) {
+            self.quiet_at = Some(Instant::now());
+            self.silent_since = None;
+            self.underrun_seen = UNDERRUN_FRAMES.get();
+            self.stats_at = None;
+        }
+
+        /// The queue was empty when a packet came, `late` after the last:
+        /// the device played silence for want of sound.
+        pub(super) fn ran_dry(&self, late: Duration, sample_rate: u32, resampling: bool) {
+            RAN_DRY.incr();
+            if !telemetry::enabled() {
+                return;
+            }
+            let silence_ms = tenth(frames_ms(
+                UNDERRUN_FRAMES.get().saturating_sub(self.underrun_seen),
+                sample_rate,
+            ));
+            if DRY_CAUSE.ready(Duration::from_secs(1)) {
+                telemetry::note_cause("sink:ran_dry", format!("{silence_ms} ms"));
+            }
+            let record = if silence_ms >= NOTICEABLE_MS && STARVED.ready(Duration::from_secs(30)) {
+                telemetry::anomaly("audio.starved")
+            } else if DRY_EVENT.ready(Duration::from_secs(1)) {
+                telemetry::event("audio.ran_dry")
+            } else if DRY_CRUMB.ready(Duration::from_millis(250)) {
+                telemetry::crumb("audio.ran_dry")
+            } else {
+                return;
+            };
+            record
+                .ms("late_ms", late)
+                .field("silence_ms", silence_ms)
+                .ms(
+                    "writer_gap_ms",
+                    Duration::from_nanos(WRITE_GAP.load(Relaxed)),
+                )
+                .field("cushion_ms", LEFT_QUEUED_MS.load(Relaxed))
+                .field("queue_limit", QUEUE_LIMIT)
+                .field("sample_rate", sample_rate)
+                .field("resampling", resampling)
+                .field(
+                    "since_track_change_ms",
+                    age_ms(TRACK_CHANGED_AT.load(Relaxed)),
+                )
+                .field("since_load_ms", age_ms(LOAD_STARTED_AT.load(Relaxed)))
+                .emit();
+        }
+
+        /// A packet joined `queued_before` frames of sound in the queue.
+        /// `peak` is its loudest sample, measured while telemetry is on.
+        pub(super) fn appended(&mut self, output: &Output, queued_before: u64, peak: Option<f32>) {
+            WRITES.incr();
+            EXPECT_AUDIO.store(!output.sink.is_paused(), Relaxed);
+            if telemetry::enabled() {
+                let queued_ms = frames_ms(queued_before, output.sample_rate);
+                QUEUE_MAX_MS.raise(queued_ms as i64);
+                self.stats_min_ms = Some(
+                    self.stats_min_ms
+                        .map_or(queued_ms, |min| min.min(queued_ms)),
+                );
+                self.window_min_ms = Some(
+                    self.window_min_ms
+                        .map_or(queued_ms, |min| min.min(queued_ms)),
+                );
+                if let Some(peak) = peak {
+                    self.heard(peak);
+                }
+                self.check_output(output, queued_ms);
+                if telemetry::tracing()
+                    && let Some(trace) = first_audio()
+                {
+                    FIRST_RENDER_AT.store(0, Relaxed);
+                    FIRST_RENDER_PENDING.store(true, Relaxed);
+                    self.first = Some((trace, now_ns(), queued_ms));
+                } else {
+                    self.report_first_render(output);
+                }
+                self.stats(output, queued_ms);
+            }
+            self.underrun_seen = UNDERRUN_FRAMES.get();
+        }
+
+        fn heard(&mut self, peak: f32) {
+            let now = Instant::now();
+            if peak < LOUD {
+                self.quiet_at = Some(now);
+            }
+            if peak < SILENT {
+                self.silent_since = Some(self.silent_since.unwrap_or(now));
+            } else if let Some(since) = self.silent_since.take() {
+                // Silence in the music itself, not a fault: kept so a gap a
+                // listener reports can be told from one in the recording.
+                let silent = now.saturating_duration_since(since);
+                if silent >= Duration::from_secs(2) {
+                    telemetry::crumb("audio.signal_gap")
+                        .ms("silent_ms", silent)
+                        .emit();
+                }
+            }
+        }
+
+        /// The device has rendered silence for a while, although what was
+        /// queued ahead of it was loud: the sound is lost between the queue
+        /// and the device, in a ramp left closed or a mixer nobody plays.
+        fn check_output(&self, output: &Output, queued_ms: f64) {
+            let silent_ms = frames_ms(SILENT_RUN.load(Relaxed), output.sample_rate);
+            if silent_ms < NOTICEABLE_MS {
+                return;
+            }
+            let Some(quiet_at) = self.quiet_at else {
+                return;
+            };
+            let loud_ms = telemetry::duration_ms(quiet_at.elapsed());
+            if loud_ms < silent_ms + queued_ms + 100.0
+                || !SILENT_OUTPUT.ready(Duration::from_secs(60))
+            {
+                return;
+            }
+            telemetry::anomaly("audio.silent_output")
+                .field("silent_ms", tenth(silent_ms))
+                .field("signal_ms", loud_ms)
+                .field("queued_ms", tenth(queued_ms))
+                .field("interrupt_gain", envelope_gain(&output.envelope))
+                .field("interrupt_target", envelope_target(&output.envelope))
+                .field("transport_gain", envelope_gain(&output.transport))
+                .field("transport_target", envelope_target(&output.transport))
+                .field(
+                    "volume",
+                    f64::from(f32::from_bits(output.volume.load(Relaxed))),
+                )
+                .field("sink_paused", output.sink.is_paused())
+                .field("device_paused", output.device.is_paused())
+                .field("sample_rate", output.sample_rate)
+                .field("resampling", output.resampler.is_some())
+                .emit();
+        }
+
+        /// Reports how long the device took to ask for a traced change's
+        /// first packet, once it has.
+        fn report_first_render(&mut self, output: &Output) {
+            let Some((trace, queued_at, ahead_ms)) = self.first else {
+                return;
+            };
+            let rendered_at = FIRST_RENDER_AT.load(Relaxed);
+            if rendered_at == 0 {
+                if since_ns(queued_at) > Duration::from_secs(5) {
+                    self.first = None;
+                    FIRST_RENDER_PENDING.store(false, Relaxed);
+                }
+                return;
+            }
+            self.first = None;
+            telemetry::event("audio.first_render")
+                .field("trace", trace)
+                .ms(
+                    "render_delay_ms",
+                    Duration::from_nanos(rendered_at.saturating_sub(queued_at)),
+                )
+                .field("queued_ahead_ms", tenth(ahead_ms))
+                .ms("latency_ms", output.device.clock().latency())
+                .emit();
+        }
+
+        /// Every few seconds, a crumb on how the output keeps up, for the
+        /// flight recorder to show around an anomaly. A device that plays
+        /// less than the window has fallen behind.
+        fn stats(&mut self, output: &Output, queued_ms: f64) {
+            let now = Instant::now();
+            let Some(at) = self.stats_at else {
+                self.stats_at = Some(now);
+                self.stats_played = output.device.clock().played();
+                self.stats_underrun = UNDERRUN_FRAMES.get();
+                return;
+            };
+            let window = now.saturating_duration_since(at);
+            if window < STATS_EVERY {
+                return;
+            }
+            let clock = output.device.clock();
+            let played = clock.played();
+            let underrun = UNDERRUN_FRAMES.get();
+            telemetry::crumb("audio.stats")
+                .ms("window_ms", window)
+                .ms("played_ms", played.saturating_sub(self.stats_played))
+                .field("queued_ms", tenth(queued_ms))
+                .field("queue_min_ms", self.stats_min_ms.map(tenth))
+                .field(
+                    "underrun_ms",
+                    tenth(frames_ms(
+                        underrun.saturating_sub(self.stats_underrun),
+                        output.sample_rate,
+                    )),
+                )
+                .ms("latency_ms", clock.latency())
+                .field("sample_rate", output.sample_rate)
+                .field("resampling", output.resampler.is_some())
+                .emit();
+            self.stats_at = Some(now);
+            self.stats_played = played;
+            self.stats_underrun = underrun;
+            self.stats_min_ms = None;
+            match self.window_at {
+                Some(start) if now.saturating_duration_since(start) >= GAUGE_WINDOW => {
+                    if let Some(min) = self.window_min_ms.take() {
+                        QUEUE_MIN_MS.set(min as i64);
+                    }
+                    self.window_at = Some(now);
+                }
+                None => self.window_at = Some(now),
+                Some(_) => {}
+            }
+        }
+    }
+
+    fn envelope_gain(envelope: &Envelope) -> f64 {
+        f64::from(envelope.level.load(Relaxed)) / f64::from(SCALE)
+    }
+
+    fn envelope_target(envelope: &Envelope) -> f64 {
+        f64::from(envelope.target.load(Relaxed)) / f64::from(SCALE)
+    }
 }
 
 #[cfg(test)]

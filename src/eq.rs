@@ -7,9 +7,13 @@
 //! This stage does not clip boosted samples. `vis::Tapped` limits the signal
 //! later, after accounting for output volume.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::Duration;
 
 use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
+
+/// At most one diagnostics crumb a second while a slider moves.
+static CHANGED: crate::telemetry::Throttle = crate::telemetry::Throttle::new();
 
 /// The centre frequencies, Winamp's, in hertz.
 pub const BANDS: [f32; 10] = [
@@ -439,16 +443,43 @@ impl Processor {
         }
     }
 
+    /// Whether the equalizer is switched on.
+    pub fn is_on(&self) -> bool {
+        self.applied.on
+    }
+
     /// Runs interleaved stereo samples through the equalizer, in place.
     pub fn process(&mut self, samples: &mut [f64]) {
-        let wanted = self
-            .shared
-            .lock()
+        // The interface holds the same lock while a slider moves; count the
+        // times the player's thread has to wait for it.
+        let locked = match self.shared.try_lock() {
+            Ok(settings) => Ok(settings),
+            Err(TryLockError::WouldBlock) => {
+                crate::sink::metrics::eq_lock_waited();
+                self.shared.lock()
+            }
+            Err(TryLockError::Poisoned(poisoned)) => Err(poisoned),
+        };
+        let wanted = locked
             .map(|settings| settings.clamped())
             .unwrap_or(self.applied);
         if wanted != self.applied {
             self.applied = wanted;
             self.rebuild();
+            if CHANGED.ready(Duration::from_secs(1)) {
+                crate::telemetry::crumb("audio.eq_changed")
+                    .field("on", wanted.on)
+                    .field("preamp_db", wanted.preamp_db)
+                    .field(
+                        "loudest_band_db",
+                        wanted
+                            .bands_db
+                            .iter()
+                            .fold(f32::MIN, |loudest, band| loudest.max(*band)),
+                    )
+                    .field("mono", wanted.mono)
+                    .emit();
+            }
         }
         let shaping = self.applied.on && !(self.chains[0].is_empty() && self.gain == 1.0);
         let gains = self.applied.channel_gains();

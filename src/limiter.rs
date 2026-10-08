@@ -77,6 +77,13 @@ impl Limiter {
         }
     }
 
+    /// The gain now applied; one means no reduction. It stops being finite
+    /// only when a non-finite sample got in, which silences everything
+    /// after it until the limiter is rebuilt.
+    pub fn gain(&self) -> f64 {
+        self.gain
+    }
+
     /// Limits interleaved stereo `frames` to `full_scale`.
     ///
     /// `full_scale` may exceed one when output volume is applied later. For
