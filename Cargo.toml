@@ -156,6 +156,12 @@ pbkdf2 = "0.12"
 aes = "0.8"
 ctr = "0.9"
 
+# Telemetry's heartbeat reads CPU time, peak memory, involuntary context
+# switches and page faults from getrusage. Already in the tree through std's
+# dependents; named here for the direct use.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 # The application menus and Dock menu (src/mac_menu.rs). "exception" lets

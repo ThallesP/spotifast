@@ -43,6 +43,7 @@ pub mod single_instance;
 pub mod sink;
 pub mod skin;
 pub mod system_fonts;
+pub mod telemetry;
 pub mod theme;
 pub mod thumbbar;
 pub mod ui;
