@@ -166,8 +166,16 @@ pub async fn wait_for_code(
     mut cancel: watch::Receiver<bool>,
 ) -> Result<String> {
     let address: SocketAddr = ([127, 0, 0, 1], port).into();
+    let started = std::time::Instant::now();
     let listener = TcpListener::bind(address)
         .await
+        .inspect_err(|error| {
+            crate::telemetry::event("auth.redirect")
+                .field("role", redirect_role(port))
+                .field("outcome", "bind_failed")
+                .field("io_kind", format!("{:?}", error.kind()))
+                .emit();
+        })
         .with_context(|| format!("unable to listen on {address} for the Spotify redirect"))?;
     let deadline = tokio::time::sleep(LOGIN_TIMEOUT);
     tokio::pin!(deadline);
@@ -176,10 +184,16 @@ pub async fn wait_for_code(
         let (mut stream, _) = tokio::select! {
             accepted = listener.accept() => accepted.context("redirect listener failed")?,
             _ = cancel.changed() => {
-                if *cancel.borrow() { bail!("sign-in cancelled"); }
+                if *cancel.borrow() {
+                    report_redirect(port, "cancelled", started);
+                    bail!("sign-in cancelled");
+                }
                 continue;
             }
-            _ = &mut deadline => bail!("sign-in timed out; try again"),
+            _ = &mut deadline => {
+                report_redirect(port, "timeout", started);
+                bail!("sign-in timed out; try again")
+            }
         };
 
         let mut reader = BufReader::new(&mut stream);
@@ -198,6 +212,11 @@ pub async fn wait_for_code(
         );
         let _ = stream.write_all(response.as_bytes()).await;
         let _ = stream.shutdown().await;
+        // Never the request line: it carries the code and state.
+        match &outcome {
+            Ok(_) => report_redirect(port, "code_received", started),
+            Err(error) => report_redirect(port, redirect_refusal(&error.to_string()), started),
+        }
         match outcome {
             Ok(code) => return Ok(code),
             Err(error) => {
@@ -207,6 +226,43 @@ pub async fn wait_for_code(
             }
         }
     }
+}
+
+fn redirect_role(port: u16) -> &'static str {
+    match port {
+        PLAYBACK_REDIRECT_PORT => "playback",
+        WEB_REDIRECT_PORT => "web",
+        _ => "other",
+    }
+}
+
+/// Which of `parse_request_line`'s fixed refusals this was.
+fn redirect_refusal(message: &str) -> &'static str {
+    match message {
+        "malformed request" => "malformed",
+        "unexpected redirect path" => "ignored_path",
+        "state mismatch" => "state_mismatch",
+        message if message.starts_with("Spotify refused") => "spotify_error",
+        _ => "no_code",
+    }
+}
+
+fn report_redirect(port: u16, outcome: &'static str, started: std::time::Instant) {
+    // A stray request (a favicon, a stale tab) is a detail; the end of the
+    // wait is the event.
+    let record = if matches!(
+        outcome,
+        "malformed" | "ignored_path" | "state_mismatch" | "no_code"
+    ) {
+        crate::telemetry::crumb("auth.redirect")
+    } else {
+        crate::telemetry::event("auth.redirect")
+    };
+    record
+        .field("role", redirect_role(port))
+        .field("outcome", outcome)
+        .since("wait_ms", started)
+        .emit();
 }
 
 fn parse_request_line(line: &str, expected_state: &str) -> Result<String> {
@@ -292,15 +348,96 @@ async fn token_request(
     http: &reqwest::Client,
     form: &[(&str, &str)],
 ) -> std::result::Result<TokenResponse, TokenEndpointError> {
+    let started = std::time::Instant::now();
     let response = http
         .post(TOKEN_URL)
         .form(form)
         .send()
         .await
-        .map_err(|error| TokenEndpointError::Unreachable(error.to_string()))?;
+        .map_err(|error| {
+            report_token_request(form, started, None, None, Some(&error), "unreachable", None);
+            TokenEndpointError::Unreachable(error.to_string())
+        })?;
     let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
     let text = response.text().await.unwrap_or_default();
-    decode_token_response(status, &text)
+    let result = decode_token_response(status, &text);
+    let outcome = match &result {
+        Ok(_) => "ok",
+        Err(TokenEndpointError::Rejected { .. }) => "rejected",
+        Err(TokenEndpointError::Unreachable(_)) if status.is_success() => "unreadable",
+        Err(TokenEndpointError::Unreachable(_)) => "unavailable",
+    };
+    let oauth_error = status.is_client_error().then(|| oauth_error_class(&text));
+    report_token_request(
+        form,
+        started,
+        Some(status.as_u16()),
+        retry_after,
+        None,
+        outcome,
+        oauth_error,
+    );
+    result
+}
+
+/// The token endpoint's own classification, never its text.
+fn oauth_error_class(text: &str) -> &'static str {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok();
+    match value.as_ref().and_then(|value| value["error"].as_str()) {
+        Some("invalid_grant") => "invalid_grant",
+        Some("invalid_client") => "invalid_client",
+        Some("invalid_scope") => "invalid_scope",
+        Some("access_denied") => "access_denied",
+        Some("invalid_request") => "invalid_request",
+        Some(_) => "other",
+        None => "unparsed",
+    }
+}
+
+/// `auth.token_request`: which grant asked for what and how it went. The
+/// form carries the code, verifier and refresh token, so only its grant
+/// type and a classification of its client id are read.
+fn report_token_request(
+    form: &[(&str, &str)],
+    started: std::time::Instant,
+    status: Option<u16>,
+    retry_after_s: Option<u64>,
+    error: Option<&reqwest::Error>,
+    outcome: &'static str,
+    oauth_error: Option<&'static str>,
+) {
+    let value = |name: &str| {
+        form.iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| *value)
+    };
+    let grant_type = match value("grant_type") {
+        Some("refresh_token") => "refresh_token",
+        Some("authorization_code") => "authorization_code",
+        _ => "other",
+    };
+    let client = match value("client_id") {
+        Some(DEFAULT_WEB_CLIENT_ID) => "shared",
+        Some(PLAYBACK_CLIENT_ID) => "playback",
+        Some(_) => "personal",
+        None => "none",
+    };
+    crate::telemetry::event("auth.token_request")
+        .field("grant_type", grant_type)
+        .field("client", client)
+        .field("outcome", outcome)
+        .field("status", status)
+        .field("retry_after_s", retry_after_s)
+        .field("oauth_error", oauth_error)
+        .field("error_kind", error.map(crate::http::error_class))
+        .field_with("io_kind", || error.and_then(crate::http::io_kind))
+        .since("ms", started)
+        .emit();
 }
 
 fn decode_token_response(

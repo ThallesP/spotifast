@@ -17,6 +17,7 @@ pub struct Http {
 
 impl Http {
     pub fn new(client: reqwest::Client) -> Self {
+        register_meters();
         Self {
             inner: Arc::new(RwLock::new(Ok(client))),
         }
@@ -29,6 +30,10 @@ impl Http {
     /// Keep the interface available to repair settings without permitting
     /// requests to bypass the configuration that failed to build.
     pub fn unavailable(error: String) -> Self {
+        register_meters();
+        crate::telemetry::crumb("api.http_client")
+            .field("phase", "unavailable")
+            .emit();
         Self {
             inner: Arc::new(RwLock::new(Err(error))),
         }
@@ -36,17 +41,100 @@ impl Http {
 
     pub fn replace(&self, client: reqwest::Client) {
         *self.inner.write().unwrap_or_else(|lock| lock.into_inner()) = Ok(client);
+        // A new client starts with an empty connection pool, so the next
+        // requests pay for fresh connections.
+        crate::telemetry::event("api.http_client")
+            .field("phase", "replaced")
+            .emit();
     }
 
     pub fn block(&self, error: String) {
         *self.inner.write().unwrap_or_else(|lock| lock.into_inner()) = Err(error);
+        crate::telemetry::event("api.http_client")
+            .field("phase", "blocked")
+            .emit();
     }
 
     pub fn client(&self) -> Result<reqwest::Client, String> {
-        self.inner
+        let client = self
+            .inner
             .read()
             .unwrap_or_else(|lock| lock.into_inner())
-            .clone()
+            .clone();
+        if client.is_err() {
+            UNAVAILABLE_HITS.incr();
+            if UNAVAILABLE_REPORT.ready(Duration::from_secs(10)) {
+                crate::telemetry::crumb("api.http_client")
+                    .field("phase", "unavailable_hit")
+                    .field("hits", UNAVAILABLE_HITS.get())
+                    .emit();
+            }
+        }
+        client
+    }
+}
+
+static UNAVAILABLE_HITS: crate::telemetry::Counter =
+    crate::telemetry::Counter::new("api_http_unavailable");
+static UNAVAILABLE_REPORT: crate::telemetry::Throttle = crate::telemetry::Throttle::new();
+
+fn register_meters() {
+    crate::telemetry::register_counters(&[&UNAVAILABLE_HITS]);
+}
+
+/// A request error's class for telemetry. Never its text: that carries the
+/// URL and its query.
+pub(crate) fn error_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_status() {
+        "status"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_builder() {
+        "builder"
+    } else {
+        "other"
+    }
+}
+
+/// The operating system's error kind beneath a request error, if any.
+pub(crate) fn io_kind(error: &reqwest::Error) -> Option<String> {
+    let mut source = std::error::Error::source(error);
+    while let Some(inner) = source {
+        if let Some(io) = inner.downcast_ref::<std::io::Error>() {
+            return Some(format!("{:?}", io.kind()));
+        }
+        source = std::error::Error::source(inner);
+    }
+    None
+}
+
+/// The innermost cause beneath a request error, without the outer message
+/// that names the URL. Pass it through `telemetry::scrub` before reporting.
+pub(crate) fn root_cause(error: &reqwest::Error) -> Option<String> {
+    let mut cause = std::error::Error::source(error)?;
+    while let Some(inner) = std::error::Error::source(cause) {
+        cause = inner;
+    }
+    Some(cause.to_string())
+}
+
+fn proxy_kind(proxy: &ProxyConfig) -> &'static str {
+    match proxy {
+        ProxyConfig::Invalid(_) => "invalid",
+        ProxyConfig::Off => "off",
+        ProxyConfig::System => "system",
+        ProxyConfig::Http(_) => "http",
+        ProxyConfig::Socks(_) => "socks",
     }
 }
 
@@ -63,10 +151,24 @@ impl From<reqwest::Client> for Http {
 }
 
 pub fn build_client(proxy: &ProxyConfig) -> Result<reqwest::Client, String> {
-    client_builder(proxy)?
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| error.without_url().to_string())
+    let built = client_builder(proxy).and_then(|builder| {
+        builder
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| error.without_url().to_string())
+    });
+    // The pool settings in force when a request later stalls: a total
+    // timeout only, with no connect timeout or keep-alive.
+    crate::telemetry::event("api.http_client")
+        .field("phase", "built")
+        .field("proxy_kind", proxy_kind(proxy))
+        .field("ok", built.is_ok())
+        .field("timeout_s", 30)
+        .field("connect_timeout", false)
+        .field("tcp_keepalive", false)
+        .field("http2_keepalive", false)
+        .emit();
+    built
 }
 
 pub fn build_blocking(

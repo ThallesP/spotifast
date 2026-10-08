@@ -3,7 +3,9 @@
 //! no per-app quota, so a playlist someone else owns opens without waiting on
 //! the shared app's rate limit.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use librespot_core::{FileId, Session, SpotifyUri, error::ErrorKind, spotify_id::SpotifyId};
@@ -110,7 +112,14 @@ async fn rows_page(
     let list = window(session, id, offset, limit).await?;
     let rows = rows(&list, offset, limit);
     let total = total(&list);
-    complete(rows.len(), offset, limit, total)?;
+    complete(rows.len(), offset, limit, total).inspect_err(|_| {
+        crate::telemetry::crumb("session.read")
+            .field("call", "playlist_range")
+            .field("outcome", "short_window")
+            .field("asked", limit)
+            .field("answered", rows.len())
+            .emit();
+    })?;
     let playables = if details {
         metadata(session, rows.iter().map(|row| &row.id)).await?
     } else {
@@ -155,7 +164,10 @@ fn page(items: Vec<PlaylistItem>, total: u32, offset: u32, limit: u32) -> Page<P
 /// details from one batched request. Spotify mixes a station afresh each
 /// time it is resolved, so the list returned here is the one to play.
 pub async fn station(session: &Session, station: &str) -> anyhow::Result<Vec<Track>> {
-    let context = session.spclient().get_context(station).await?;
+    let started = Instant::now();
+    let context = session.spclient().get_context(station).await;
+    note_read("context", 1, started, context.as_ref().err());
+    let context = context?;
     let uris = station_songs(&context);
     anyhow::ensure!(!uris.is_empty(), "Spotify has no songs for this radio");
     let found = metadata(session, uris.iter())
@@ -202,7 +214,11 @@ pub async fn audiobook_shows(session: &Session, uris: &[String]) -> anyhow::Resu
     if request.entity_request.is_empty() {
         return Ok(Vec::new());
     }
-    let response = session.spclient().get_extended_metadata(request).await?;
+    let batch = request.entity_request.len();
+    let started = Instant::now();
+    let response = session.spclient().get_extended_metadata(request).await;
+    note_read("show_metadata", batch, started, response.as_ref().err());
+    let response = response?;
     Ok(audiobooks_in(&response))
 }
 
@@ -249,11 +265,14 @@ fn audiobooks_in(response: &BatchedExtensionResponse) -> Vec<String> {
 /// The display name behind a user id, from the profile view Spotify's
 /// clients read; `None` when nothing answers.
 pub async fn user_display_name(session: &Session, user_id: &str) -> Option<String> {
+    let started = Instant::now();
     let bytes = session
         .spclient()
         .get_user_profile(user_id, Some(0), Some(0))
-        .await
-        .ok()?;
+        .await;
+    // Never the user id.
+    note_read("user_profile", 1, started, bytes.as_ref().err());
+    let bytes = bytes.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     json.get("name")
         .and_then(|value| value.as_str())
@@ -272,9 +291,19 @@ async fn window(
         id: SpotifyId::from_base62(id)?,
         user: None,
     };
-    SessionPlaylist::get_range(session, &uri, from as usize, length as usize)
-        .await
-        .map_err(refused)
+    let started = Instant::now();
+    let list = SessionPlaylist::get_range(session, &uri, from as usize, length as usize).await;
+    note_read(
+        if length == 0 {
+            "playlist_header"
+        } else {
+            "playlist_range"
+        },
+        length as usize,
+        started,
+        list.as_ref().err(),
+    );
+    list.map_err(refused)
 }
 
 /// The owner's user id, which the session decorates onto the playlist's URI.
@@ -438,8 +467,125 @@ async fn metadata(
     if asked.is_empty() {
         return Ok(HashMap::new());
     }
-    let response = session.spclient().get_extended_metadata(request).await?;
-    answers(&asked, response)
+    let started = Instant::now();
+    let response = match session.spclient().get_extended_metadata(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            note_read("track_metadata", asked.len(), started, Some(&error));
+            return Err(error.into());
+        }
+    };
+    note_read("track_metadata", asked.len(), started, None);
+    let answered = answers(&asked, response);
+    if answered.is_err() {
+        // Spotify answered, but not for every row: the page is retried on
+        // the Web API.
+        crate::telemetry::crumb("session.read")
+            .field("call", "track_metadata")
+            .field("outcome", "incomplete")
+            .field("asked", asked.len())
+            .since("ms", started)
+            .emit();
+    }
+    answered
+}
+
+mod meters {
+    use crate::telemetry::{Counter, Gauge};
+
+    pub static READS: Counter = Counter::new("session_reads");
+    pub static FAILED: Counter = Counter::new("session_reads_failed");
+    /// librespot's own limiter (300 calls per 30 s per domain, shared with
+    /// playback) or a 429 it would not wait out.
+    pub static EXHAUSTED: Counter = Counter::new("session_reads_exhausted");
+    pub static PLAYLIST: Counter = Counter::new("session_reads_playlist");
+    pub static METADATA: Counter = Counter::new("session_reads_metadata");
+    pub static PROFILE: Counter = Counter::new("session_reads_profile");
+    pub static CONTEXT: Counter = Counter::new("session_reads_context");
+    pub static RATE_30S: Gauge = Gauge::peak("session_reads_30s_peak");
+    pub static MAX_MS: Gauge = Gauge::peak("session_read_max_ms");
+}
+
+static RECENT_READS: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
+static REGISTER: std::sync::Once = std::sync::Once::new();
+
+/// One spclient read, for telemetry: what, how many entities, how long, and
+/// librespot's error kind. Never a URI, user id or URL.
+fn note_read(
+    call: &'static str,
+    batch: usize,
+    started: Instant,
+    error: Option<&librespot_core::Error>,
+) {
+    REGISTER.call_once(|| {
+        crate::telemetry::register_counters(&[
+            &meters::READS,
+            &meters::FAILED,
+            &meters::EXHAUSTED,
+            &meters::PLAYLIST,
+            &meters::METADATA,
+            &meters::PROFILE,
+            &meters::CONTEXT,
+        ]);
+        crate::telemetry::register_gauges(&[&meters::RATE_30S, &meters::MAX_MS]);
+    });
+    let took = started.elapsed();
+    meters::READS.incr();
+    match call {
+        "playlist_header" | "playlist_range" => meters::PLAYLIST.incr(),
+        "track_metadata" | "show_metadata" => meters::METADATA.incr(),
+        "user_profile" => meters::PROFILE.incr(),
+        _ => meters::CONTEXT.incr(),
+    }
+    meters::MAX_MS.raise(took.as_millis() as i64);
+    let kind = error.map(|error| error.kind);
+    if kind.is_some() {
+        meters::FAILED.incr();
+    }
+    if kind == Some(ErrorKind::ResourceExhausted) {
+        meters::EXHAUSTED.incr();
+    }
+    if !crate::telemetry::enabled() {
+        return;
+    }
+    let in_window = {
+        let now = Instant::now();
+        let mut recent = RECENT_READS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while recent
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) > Duration::from_secs(30))
+            || recent.len() >= 2048
+        {
+            recent.pop_front();
+        }
+        recent.push_back(now);
+        recent.len()
+    };
+    meters::RATE_30S.raise(in_window as i64);
+    // Slow or throttled reads ship; they can hold up a page, or a resume
+    // waiting on the same connection and limiter.
+    let notable = took >= Duration::from_secs(2)
+        || matches!(
+            kind,
+            Some(
+                ErrorKind::ResourceExhausted | ErrorKind::DeadlineExceeded | ErrorKind::Unavailable
+            )
+        );
+    let record = if notable {
+        crate::telemetry::event("session.read")
+    } else {
+        crate::telemetry::crumb("session.read")
+    };
+    record
+        .field("call", call)
+        .field("batch", batch)
+        .field("outcome", if kind.is_some() { "error" } else { "ok" })
+        .field_with("error_kind", || kind.map(|kind| format!("{kind:?}")))
+        .field("reads_30s", in_window)
+        .ms("ms", took)
+        .emit();
 }
 
 /// One request for the details of every track and episode among `uris`,

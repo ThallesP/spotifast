@@ -63,12 +63,16 @@ impl History {
             return;
         }
         self.dirty = false;
+        let started = std::time::Instant::now();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         match serde_json::to_string(&self.plays) {
             Ok(text) => {
-                if let Err(error) = std::fs::write(path, text) {
+                let bytes = text.len();
+                let written = std::fs::write(path, text);
+                report_save(started, self.plays.len(), bytes, written.is_ok());
+                if let Err(error) = written {
                     log::warn!("could not write the play history: {error}");
                 }
             }
@@ -97,6 +101,24 @@ impl History {
         self.plays.clear();
         self.dirty = true;
     }
+}
+
+/// The save runs on the interface thread, so a slow disk shows as a stall.
+fn report_save(started: std::time::Instant, plays: usize, bytes: usize, ok: bool) {
+    let took = started.elapsed();
+    let record = if took >= std::time::Duration::from_millis(50) || !ok {
+        crate::telemetry::event("app.history_save")
+    } else {
+        crate::telemetry::crumb("app.history_save")
+    };
+    record
+        .field("plays", plays)
+        .field("bytes", bytes)
+        .field("ok", ok)
+        // Written in place, not through a temporary file and a rename.
+        .field("atomic", false)
+        .ms("ms", took)
+        .emit();
 }
 
 /// Converts the playing track into a history record.

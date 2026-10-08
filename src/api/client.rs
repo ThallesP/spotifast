@@ -4,7 +4,7 @@
 //! concurrency, honors `Retry-After`, and formats API errors. The gateway
 //! handles capability differences before dispatch.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,6 +18,7 @@ use tokio::sync::Semaphore;
 use super::ApiSource;
 use super::models::*;
 use crate::http::Http;
+use crate::telemetry;
 
 const BASE_URL: &str = "https://api.spotify.com/v1";
 const MAX_IN_FLIGHT: usize = 6;
@@ -82,9 +83,10 @@ pub enum TokenProvider {
 }
 
 impl TokenProvider {
-    async fn access_token(&self) -> Result<String> {
+    /// `lock_wait` receives how long the request queued for the token lock.
+    async fn access_token(&self, lock_wait: &mut Duration) -> Result<String> {
         match self {
-            Self::Web(tokens) => tokens.access_token(false).await,
+            Self::Web(tokens) => tokens.access_token_timed(false, lock_wait).await,
         }
     }
 
@@ -137,22 +139,40 @@ impl WebTokens {
     /// A valid access token, refreshing first when it is close to expiry or
     /// `force` asks for a fresh one after a 401.
     async fn access_token(&self, force: bool) -> Result<String> {
+        let mut lock_wait = Duration::ZERO;
+        self.access_token_timed(force, &mut lock_wait).await
+    }
+
+    async fn access_token_timed(&self, force: bool, lock_wait: &mut Duration) -> Result<String> {
+        let asked = Instant::now();
         let mut guard = self.token.lock().await;
+        *lock_wait = asked.elapsed();
         if !self.lease.current() {
             return Err(ApiError::SignInExpired {
                 api_source: self.source,
             });
         }
         if force || guard.needs_refresh() {
+            let refresh = RefreshProbe::new(
+                self.source,
+                force,
+                &guard,
+                *lock_wait,
+                self.remember.load(std::sync::atomic::Ordering::Relaxed),
+            );
             let client_id = guard.client_id.clone();
             let refresh_token = guard.refresh_token.clone();
-            match crate::auth::refresh(
-                &self.http.client().map_err(ApiError::Network)?,
-                &client_id,
-                &refresh_token,
-            )
-            .await
-            {
+            let http = match self.http.client() {
+                Ok(http) => http,
+                Err(error) => {
+                    refresh.end("client_unavailable", None, None);
+                    return Err(ApiError::Network(error));
+                }
+            };
+            let requested = Instant::now();
+            let answer = crate::auth::refresh(&http, &client_id, &refresh_token).await;
+            let refresh = refresh.answered(requested.elapsed());
+            match answer {
                 Ok(response) => match crate::auth::StoredToken::from_response(
                     &client_id,
                     response,
@@ -160,6 +180,7 @@ impl WebTokens {
                 ) {
                     Ok(updated) => {
                         if !self.lease.current() {
+                            refresh.end("lease_stale", None, None);
                             return Err(ApiError::SignInExpired {
                                 api_source: self.source,
                             });
@@ -179,25 +200,106 @@ impl WebTokens {
                             });
                         }
                         *guard = updated;
+                        refresh.end("ok", None, None);
                     }
                     Err(error) => {
+                        refresh.end("unusable_response", None, Some(&error.to_string()));
                         log::warn!("token refresh returned an unusable response: {error}")
                     }
                 },
-                Err(crate::auth::TokenEndpointError::Rejected { .. }) => {
+                Err(crate::auth::TokenEndpointError::Rejected { status, .. }) => {
+                    refresh.end("rejected", Some(status), None);
                     return Err(ApiError::SignInExpired {
                         api_source: self.source,
                     });
                 }
                 Err(crate::auth::TokenEndpointError::Unreachable(detail)) => {
                     if force || guard.expired() {
+                        refresh.end("unreachable", None, Some(&detail));
                         return Err(ApiError::Network(detail));
                     }
+                    refresh.end("unreachable_kept_token", None, Some(&detail));
                     log::warn!("token refresh failed, using the current token: {detail}");
                 }
             }
         }
         Ok(guard.access_token.clone())
+    }
+}
+
+/// One token refresh as telemetry sees it. Never holds token material.
+struct RefreshProbe {
+    source: ApiSource,
+    reason: &'static str,
+    lock_wait: Duration,
+    remaining_s: i64,
+    since_last_ms: Option<u64>,
+    persisted: bool,
+    took: Option<Duration>,
+}
+
+impl RefreshProbe {
+    fn new(
+        source: ApiSource,
+        force: bool,
+        token: &crate::auth::StoredToken,
+        lock_wait: Duration,
+        persisted: bool,
+    ) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let last = LAST_REFRESH_MS[grant_index(source)].load(Ordering::Relaxed);
+        Self {
+            source,
+            reason: if force {
+                "forced_401"
+            } else if token.expired() {
+                "expired"
+            } else {
+                "expiring"
+            },
+            lock_wait,
+            remaining_s: token.expires_at as i64 - now as i64,
+            since_last_ms: (last != 0).then(|| clock_ms().saturating_sub(last)),
+            persisted,
+            took: None,
+        }
+    }
+
+    fn answered(mut self, took: Duration) -> Self {
+        self.took = Some(took);
+        self
+    }
+
+    fn end(&self, outcome: &'static str, status: Option<u16>, detail: Option<&str>) {
+        LAST_REFRESH_MS[grant_index(self.source)].store(clock_ms(), Ordering::Relaxed);
+        meters::REFRESHES.incr();
+        if outcome != "ok" {
+            meters::REFRESH_FAILURES.incr();
+        }
+        // A forced refresh right after another one: concurrent 401s each
+        // asking for a token that was already renewed.
+        let redundant =
+            self.reason == "forced_401" && self.since_last_ms.is_some_and(|since| since < 5_000);
+        if redundant {
+            meters::REDUNDANT_REFRESHES.incr();
+        }
+        let record = telemetry::event("auth.refresh")
+            .field("grant", grant_name(self.source))
+            .field("reason", self.reason)
+            .field("outcome", outcome)
+            .field("status", status)
+            .field("ms", self.took.map(telemetry::duration_ms))
+            .ms("lock_wait_ms", self.lock_wait)
+            .field("remaining_s_before", self.remaining_s)
+            .field("since_last_refresh_ms", self.since_last_ms)
+            .field("persisted", self.persisted)
+            .field("redundant", redundant);
+        match detail {
+            Some(detail) => record.text("detail", detail).emit(),
+            None => record.emit(),
+        }
     }
 }
 
@@ -334,6 +436,7 @@ pub struct ApiClient {
     artist_albums_limit: u32,
     source: ApiSource,
     activity: Arc<NetActivity>,
+    probe: ClientProbe,
 }
 
 impl ApiClient {
@@ -344,6 +447,7 @@ impl ApiClient {
         artist_albums_limit: u32,
         source: ApiSource,
     ) -> Self {
+        register_meters();
         Self {
             #[cfg(test)]
             base_url: None,
@@ -356,7 +460,51 @@ impl ApiClient {
             artist_albums_limit,
             source,
             activity,
+            probe: ClientProbe::new(),
         }
+    }
+
+    /// Which instance this is, for telemetry: a new authorization gets a new
+    /// client, and with it a fresh cooldown.
+    pub(crate) fn telemetry_generation(&self) -> u64 {
+        self.probe.generation
+    }
+
+    /// The cooldown left, read without its lock.
+    fn cooldown_remaining_ms(&self) -> u64 {
+        self.probe
+            .cooldown_until_ms
+            .load(Ordering::Relaxed)
+            .saturating_sub(clock_ms())
+    }
+
+    /// Reports the end of a rate-limit episode once an answer arrives after
+    /// the cooldown has run out.
+    fn end_cooldown_episode(&self, status: u16) {
+        let probe = &self.probe;
+        if probe.episode_started_ms.load(Ordering::Relaxed) == 0 || self.cooldown_remaining_ms() > 0
+        {
+            return;
+        }
+        let started = probe.episode_started_ms.swap(0, Ordering::Relaxed);
+        if started == 0 {
+            return;
+        }
+        telemetry::event("api.cooldown")
+            .field("phase", "end")
+            .field("grant", grant_name(self.source))
+            .field("duration_ms", clock_ms().saturating_sub(started))
+            .field("next_status", status)
+            .field(
+                "limited_in_episode",
+                probe.episode_limited.swap(0, Ordering::Relaxed),
+            )
+            .field(
+                "requests_waited",
+                probe.episode_waited.swap(0, Ordering::Relaxed),
+            )
+            .field("client_generation", probe.generation)
+            .emit();
     }
 
     pub fn set_token_provider(&self, provider: Option<TokenProvider>) {
@@ -398,6 +546,9 @@ impl ApiClient {
     async fn extend_cooldown(&self, wait: Duration) {
         let mut until = self.cooldown_until.lock().await;
         *until = (*until).max(Instant::now() + wait);
+        self.probe
+            .cooldown_until_ms
+            .store(clock_at(*until), Ordering::Relaxed);
     }
 
     // ---- transport -------------------------------------------------------
@@ -439,19 +590,42 @@ impl ApiClient {
 
         let mut attempt = 0;
         let queue_write = method == Method::POST && path == "/me/player/queue";
+        // Telemetry only: one `api.request` per attempt, and one if this
+        // future is dropped before it answers.
+        let mut probe = RequestProbe::new(self, &method, path, query, body, jpeg, queue_write);
         loop {
             attempt = u32::saturating_add(attempt, 1);
+            probe.begin(attempt);
             self.wait_for_cooldown().await;
+            probe.cooled();
+            let waiting = Waiting::new(&self.probe.permit_waiters);
             let permit = self
                 .limiter
                 .acquire()
                 .await
                 .map_err(|_| ApiError::NotSignedIn)?;
-            let token = provider.access_token().await?;
-            let mut request = self
-                .http
-                .client()
-                .map_err(ApiError::Network)?
+            drop(waiting);
+            probe.permitted();
+            let mut token_lock = Duration::ZERO;
+            let token = match provider.access_token(&mut token_lock).await {
+                Ok(token) => token,
+                Err(error) => {
+                    probe.tokened(token_lock);
+                    probe.finish("token_failed", None, None, |event| {
+                        event.text("error", &error.to_string())
+                    });
+                    return Err(error);
+                }
+            };
+            probe.tokened(token_lock);
+            let http = match self.http.client() {
+                Ok(http) => http,
+                Err(error) => {
+                    probe.finish("client_unavailable", None, None, |event| event);
+                    return Err(ApiError::Network(error));
+                }
+            };
+            let mut request = http
                 .request(method.clone(), &url)
                 .bearer_auth(&token)
                 .query(query);
@@ -464,11 +638,21 @@ impl ApiClient {
             } else if matches!(method, Method::PUT | Method::POST | Method::DELETE) {
                 request = request.header(reqwest::header::CONTENT_LENGTH, "0");
             }
-            let response = request.send().await?;
+            probe.sending();
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    probe.failed(None, &error);
+                    return Err(error.into());
+                }
+            };
             let status = response.status();
+            probe.answered(&response);
 
             if status == StatusCode::UNAUTHORIZED && attempt == 1 {
                 drop(permit);
+                probe.report("unauthorized_retry", Some(401), None, |event| event);
+                probe.enter("invalidate");
                 provider.invalidate().await;
                 continue;
             }
@@ -481,8 +665,11 @@ impl ApiClient {
                     .map_or(Duration::from_secs(1), Duration::from_secs);
                 let text = response.text().await.unwrap_or_default();
                 if is_quota_exhausted(&text) {
+                    probe.rate_limited(wait, None, &text, 0, false);
+                    probe.finished = true;
                     return Err(ApiError::QuotaExhausted);
                 }
+                let asked = wait;
                 // A rejected queue append is safe to retry. Keep its place
                 // in the write lock and honor the full server-requested wait.
                 // Other requests retain their existing bounded retry policy.
@@ -498,18 +685,33 @@ impl ApiClient {
                     wait.as_millis()
                 );
                 drop(permit);
+                probe.enter("cooldown_extend");
+                let before = self.cooldown_remaining_ms();
                 self.extend_cooldown(wait).await;
+                let gave_up = !queue_write && attempt > RATE_LIMIT_RETRIES;
+                probe.rate_limited(asked, Some(wait), &text, before, gave_up);
                 if !queue_write && attempt > RATE_LIMIT_RETRIES {
+                    probe.finished = true;
                     return Err(ApiError::RateLimited);
                 }
                 continue;
             }
             if status.is_server_error() && method == Method::GET && attempt == 1 {
                 drop(permit);
+                probe.report("server_error_retry", Some(status.as_u16()), None, |event| {
+                    event
+                });
+                probe.enter("retry_sleep");
                 tokio::time::sleep(Duration::from_millis(800)).await;
                 continue;
             }
-            let text = response.text().await?;
+            let text = match response.text().await {
+                Ok(text) => text,
+                Err(error) => {
+                    probe.failed(Some(status.as_u16()), &error);
+                    return Err(error.into());
+                }
+            };
             log::debug!(
                 "Spotify request source={} method={} status={} duration_ms={}",
                 self.source,
@@ -518,6 +720,7 @@ impl ApiClient {
                 started.elapsed().as_millis()
             );
             if status.is_success() {
+                probe.finish("ok", Some(status.as_u16()), Some(text.len()), |event| event);
                 return Ok(text);
             }
             let message = serde_json::from_str::<ApiErrorBody>(&text)
@@ -530,6 +733,11 @@ impl ApiClient {
                         .unwrap_or("request failed")
                         .to_string()
                 });
+            probe.finish("status", Some(status.as_u16()), Some(text.len()), |event| {
+                event
+                    .field_with("reason", || error_reason(&text))
+                    .text("message", &message)
+            });
             return Err(ApiError::Status {
                 status: status.as_u16(),
                 message,
@@ -1171,6 +1379,1195 @@ impl ApiClient {
     }
 }
 
+// ---- telemetry -------------------------------------------------------------
+//
+// Everything below only observes requests: nothing in it changes how, when or
+// whether one is made. It is inert while telemetry is off, apart from a few
+// relaxed atomics.
+
+tokio::task_local! {
+    static CALLER: &'static str;
+}
+
+/// Runs `future` with the Web API requests it makes attributed to `caller`
+/// (the feature asking, such as `playlist_items`) in telemetry.
+pub async fn tagged<F: std::future::Future>(caller: &'static str, future: F) -> F::Output {
+    CALLER.scope(caller, future).await
+}
+
+mod meters {
+    use crate::telemetry::{Counter, Gauge};
+
+    pub static ATTEMPTS_SHARED: Counter = Counter::new("api_attempts_shared");
+    pub static ATTEMPTS_PERSONAL: Counter = Counter::new("api_attempts_personal");
+    pub static LIMITED_SHARED: Counter = Counter::new("api_429_shared");
+    pub static LIMITED_PERSONAL: Counter = Counter::new("api_429_personal");
+    pub static UNAUTHORIZED: Counter = Counter::new("api_401");
+    pub static CLIENT_ERRORS: Counter = Counter::new("api_4xx");
+    pub static SERVER_ERRORS: Counter = Counter::new("api_5xx");
+    pub static NETWORK_ERRORS: Counter = Counter::new("api_net_errors");
+    pub static TIMEOUTS: Counter = Counter::new("api_timeouts");
+    pub static CANCELLED: Counter = Counter::new("api_cancelled");
+    pub static REPEATS: Counter = Counter::new("api_repeats");
+    pub static SENT_IN_COOLDOWN: Counter = Counter::new("api_sent_in_cooldown");
+    pub static RESPONSE_BYTES: Counter = Counter::new("api_resp_bytes");
+    pub static REFRESHES: Counter = Counter::new("auth_refreshes");
+    pub static REFRESH_FAILURES: Counter = Counter::new("auth_refresh_failures");
+    pub static REDUNDANT_REFRESHES: Counter = Counter::new("auth_redundant_refreshes");
+
+    pub static IN_FLIGHT: Gauge = Gauge::peak("api_in_flight_peak");
+    pub static PENDING: Gauge = Gauge::peak("api_pending_peak");
+    pub static WAITERS: Gauge = Gauge::peak("api_permit_waiters_peak");
+    pub static LATENCY_MAX_MS: Gauge = Gauge::peak("api_latency_max_ms");
+    pub static WAIT_MAX_MS: Gauge = Gauge::peak("api_wait_max_ms");
+    pub static COOLDOWN_SHARED_MS: Gauge = Gauge::peak("api_cooldown_max_ms_shared");
+    pub static COOLDOWN_PERSONAL_MS: Gauge = Gauge::peak("api_cooldown_max_ms_personal");
+    pub static RATE_SHARED: Gauge = Gauge::peak("api_rate_30s_peak_shared");
+    pub static RATE_PERSONAL: Gauge = Gauge::peak("api_rate_30s_peak_personal");
+}
+
+fn register_meters() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        telemetry::register_counters(&[
+            &meters::ATTEMPTS_SHARED,
+            &meters::ATTEMPTS_PERSONAL,
+            &meters::LIMITED_SHARED,
+            &meters::LIMITED_PERSONAL,
+            &meters::UNAUTHORIZED,
+            &meters::CLIENT_ERRORS,
+            &meters::SERVER_ERRORS,
+            &meters::NETWORK_ERRORS,
+            &meters::TIMEOUTS,
+            &meters::CANCELLED,
+            &meters::REPEATS,
+            &meters::SENT_IN_COOLDOWN,
+            &meters::RESPONSE_BYTES,
+            &meters::REFRESHES,
+            &meters::REFRESH_FAILURES,
+            &meters::REDUNDANT_REFRESHES,
+        ]);
+        telemetry::register_gauges(&[
+            &meters::IN_FLIGHT,
+            &meters::PENDING,
+            &meters::WAITERS,
+            &meters::LATENCY_MAX_MS,
+            &meters::WAIT_MAX_MS,
+            &meters::COOLDOWN_SHARED_MS,
+            &meters::COOLDOWN_PERSONAL_MS,
+            &meters::RATE_SHARED,
+            &meters::RATE_PERSONAL,
+        ]);
+    });
+}
+
+/// Spotify's rate limit is counted over a rolling 30 seconds.
+const WINDOW: Duration = Duration::from_secs(30);
+const KEPT_ATTEMPTS: Duration = Duration::from_secs(300);
+/// Above this many attempts a second, routine answers go to the flight
+/// recorder instead of shipping; `api.budget` still counts them.
+const FLOOD_PER_SECOND: usize = 8;
+/// A first 429 after fewer attempts than this in the window is unlikely to
+/// be this process's doing.
+const EXTERNAL_BELOW: usize = 20;
+const REPEAT_WITHIN: Duration = Duration::from_secs(2);
+const STUCK_AFTER: Duration = Duration::from_secs(10);
+/// A failed `api.request` ships once per grant, route and outcome in this
+/// interval; repeats stay in the flight recorder.
+const FAILURE_EVERY: Duration = Duration::from_secs(60);
+/// A grant's `api.rate_limited` anomaly past an episode's start, and its
+/// exhausted quota, at most this often; repeats stay in the flight recorder.
+const RATE_LIMITED_EVERY: Duration = Duration::from_secs(60);
+const QUOTA_EVERY: Duration = Duration::from_secs(300);
+/// Query keys whose values are safe to report: no ids, no search text.
+const SAFE_QUERY: &[&str] = &[
+    "limit",
+    "offset",
+    "time_range",
+    "include_groups",
+    "additional_types",
+    "type",
+    "state",
+    "volume_percent",
+    "position_ms",
+];
+
+static CLOCK: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+static LAST_SENT_MS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static LAST_REFRESH_MS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static BUDGET: telemetry::Throttle = telemetry::Throttle::new();
+static RATE_LIMITED_REPORT: [telemetry::Throttle; 2] =
+    [telemetry::Throttle::new(), telemetry::Throttle::new()];
+static QUOTA_REPORT: [telemetry::Throttle; 2] =
+    [telemetry::Throttle::new(), telemetry::Throttle::new()];
+static ATTEMPTS: Mutex<VecDeque<Attempt>> = Mutex::new(VecDeque::new());
+static STARTS: Mutex<VecDeque<(Instant, u64)>> = Mutex::new(VecDeque::new());
+/// Grant index, method, path template and outcome of a shipped failure.
+type FailureKey = (usize, &'static str, &'static str, &'static str);
+static FAILURES: Mutex<Vec<(Instant, FailureKey)>> = Mutex::new(Vec::new());
+
+/// Milliseconds on a process clock, never zero, so deadlines fit an atomic.
+fn clock_at(at: Instant) -> u64 {
+    at.saturating_duration_since(*CLOCK.get_or_init(Instant::now))
+        .as_millis() as u64
+        + 1
+}
+
+fn clock_ms() -> u64 {
+    clock_at(Instant::now())
+}
+
+fn grant_index(source: ApiSource) -> usize {
+    match source {
+        ApiSource::Shared => 0,
+        ApiSource::Personal => 1,
+    }
+}
+
+fn grant_name(source: ApiSource) -> &'static str {
+    match source {
+        ApiSource::Shared => "shared",
+        ApiSource::Personal => "personal",
+    }
+}
+
+fn method_name(method: &Method) -> &'static str {
+    if *method == Method::GET {
+        "GET"
+    } else if *method == Method::POST {
+        "POST"
+    } else if *method == Method::PUT {
+        "PUT"
+    } else if *method == Method::DELETE {
+        "DELETE"
+    } else {
+        "OTHER"
+    }
+}
+
+/// A Web API path with its ids replaced, from a fixed table so no id can
+/// reach a template. A path the table lacks is `other`.
+fn template(path: &str) -> &'static str {
+    let path = if path.starts_with("http") {
+        path.find("/v1/").map_or("", |start| &path[start + 3..])
+    } else {
+        path
+    };
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    match segments.as_slice() {
+        ["me"] => "/me",
+        ["me", "player"] => "/me/player",
+        ["me", "player", "devices"] => "/me/player/devices",
+        ["me", "player", "queue"] => "/me/player/queue",
+        ["me", "player", "recently-played"] => "/me/player/recently-played",
+        ["me", "player", "play"] => "/me/player/play",
+        ["me", "player", "pause"] => "/me/player/pause",
+        ["me", "player", "next"] => "/me/player/next",
+        ["me", "player", "previous"] => "/me/player/previous",
+        ["me", "player", "seek"] => "/me/player/seek",
+        ["me", "player", "volume"] => "/me/player/volume",
+        ["me", "player", "shuffle"] => "/me/player/shuffle",
+        ["me", "player", "repeat"] => "/me/player/repeat",
+        ["me", "playlists"] => "/me/playlists",
+        ["me", "library"] => "/me/library",
+        ["me", "library", "contains"] => "/me/library/contains",
+        ["me", "tracks"] => "/me/tracks",
+        ["me", "albums"] => "/me/albums",
+        ["me", "following"] => "/me/following",
+        ["me", "shows"] => "/me/shows",
+        ["me", "episodes"] => "/me/episodes",
+        ["me", "top", "tracks"] => "/me/top/tracks",
+        ["me", "top", "artists"] => "/me/top/artists",
+        ["search"] => "/search",
+        ["recommendations"] => "/recommendations",
+        ["playlists", _] => "/playlists/{id}",
+        ["playlists", _, "items"] => "/playlists/{id}/items",
+        ["playlists", _, "tracks"] => "/playlists/{id}/tracks",
+        ["playlists", _, "images"] => "/playlists/{id}/images",
+        ["artists", _] => "/artists/{id}",
+        ["artists", _, "top-tracks"] => "/artists/{id}/top-tracks",
+        ["artists", _, "albums"] => "/artists/{id}/albums",
+        ["artists", _, "related-artists"] => "/artists/{id}/related-artists",
+        ["albums", _] => "/albums/{id}",
+        ["albums", _, "tracks"] => "/albums/{id}/tracks",
+        ["shows", _] => "/shows/{id}",
+        ["shows", _, "episodes"] => "/shows/{id}/episodes",
+        ["tracks", _] => "/tracks/{id}",
+        ["episodes", _] => "/episodes/{id}",
+        _ => "other",
+    }
+}
+
+fn query_summary(query: &[(&str, String)]) -> Option<String> {
+    let safe: Vec<String> = query
+        .iter()
+        .filter(|(key, _)| SAFE_QUERY.contains(key))
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    (!safe.is_empty()).then(|| safe.join("&"))
+}
+
+fn request_key(method: &str, path: &str, query: &[(&str, String)]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    method.hash(&mut hasher);
+    path.hash(&mut hasher);
+    query.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// How long ago the same request last started, when within
+/// [`REPEAT_WITHIN`]. Retries of one request are not repeats.
+fn repeat_gap(key: u64) -> Option<Duration> {
+    let now = Instant::now();
+    let mut starts = STARTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while starts
+        .front()
+        .is_some_and(|(at, _)| now.saturating_duration_since(*at) > REPEAT_WITHIN)
+        || starts.len() >= 512
+    {
+        starts.pop_front();
+    }
+    let gap = starts
+        .iter()
+        .rev()
+        .find(|(_, seen)| *seen == key)
+        .map(|(at, _)| now.saturating_duration_since(*at));
+    starts.push_back((now, key));
+    gap
+}
+
+/// Whether no failure of this grant, route and outcome shipped in the last
+/// [`FAILURE_EVERY`]; if so, this one is noted as shipped.
+fn first_failure(
+    source: ApiSource,
+    method: &'static str,
+    endpoint: &'static str,
+    outcome: &'static str,
+) -> bool {
+    let now = Instant::now();
+    let key: FailureKey = (grant_index(source), method, endpoint, outcome);
+    let mut shipped = FAILURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    shipped.retain(|(at, _)| now.saturating_duration_since(*at) < FAILURE_EVERY);
+    if shipped.iter().any(|(_, seen)| *seen == key) {
+        return false;
+    }
+    shipped.push((now, key));
+    true
+}
+
+/// Spotify's machine-readable reason, such as `QUOTA_EXCEEDED`; never its
+/// free-text body.
+fn error_reason(body: &str) -> Option<String> {
+    serde_json::from_str::<ApiErrorBody>(body)
+        .ok()
+        .and_then(|body| body.error.reason)
+        .filter(|reason| {
+            reason.len() <= 48
+                && reason
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+}
+
+fn retry_after_kind(raw: Option<&str>) -> &'static str {
+    match raw {
+        None => "missing",
+        // Parsed exactly as the 429 branch parses it.
+        Some(raw) if raw.parse::<u64>().is_ok() => "seconds",
+        Some(raw) if raw.contains("GMT") => "http_date",
+        Some(_) => "other",
+    }
+}
+
+/// One attempt that reached the wire, kept for the rolling window.
+struct Attempt {
+    at: Instant,
+    source: ApiSource,
+    method: &'static str,
+    endpoint: &'static str,
+    /// Zero when no status arrived.
+    status: u16,
+    ms: u32,
+}
+
+/// A grant's load in the window, this attempt included.
+struct Load {
+    grant: usize,
+    endpoint: usize,
+    limited: usize,
+    last_second: usize,
+}
+
+fn note_attempt(
+    source: ApiSource,
+    method: &'static str,
+    endpoint: &'static str,
+    status: u16,
+    wire: Duration,
+) -> Load {
+    let now = Instant::now();
+    let mut attempts = ATTEMPTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while attempts
+        .front()
+        .is_some_and(|attempt| now.saturating_duration_since(attempt.at) > KEPT_ATTEMPTS)
+        || attempts.len() >= 4096
+    {
+        attempts.pop_front();
+    }
+    attempts.push_back(Attempt {
+        at: now,
+        source,
+        method,
+        endpoint,
+        status,
+        ms: wire.as_millis().min(u128::from(u32::MAX)) as u32,
+    });
+    let mut load = Load {
+        grant: 0,
+        endpoint: 0,
+        limited: 0,
+        last_second: 0,
+    };
+    for attempt in attempts
+        .iter()
+        .rev()
+        .take_while(|attempt| now.saturating_duration_since(attempt.at) <= WINDOW)
+    {
+        if now.saturating_duration_since(attempt.at) <= Duration::from_secs(1) {
+            load.last_second += 1;
+        }
+        if attempt.source != source {
+            continue;
+        }
+        load.grant += 1;
+        if attempt.status == 429 {
+            load.limited += 1;
+        }
+        if attempt.method == method && attempt.endpoint == endpoint {
+            load.endpoint += 1;
+        }
+    }
+    load
+}
+
+/// A grant's recent load before the attempt being judged.
+#[derive(Default)]
+struct GrantLoad {
+    attempts_30s: usize,
+    attempts_300s: usize,
+    limited_30s: usize,
+    other_30s: usize,
+    since_last_429: Option<Duration>,
+}
+
+fn grant_load(source: ApiSource) -> GrantLoad {
+    let now = Instant::now();
+    let attempts = ATTEMPTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut load = GrantLoad::default();
+    for attempt in attempts.iter().rev() {
+        let age = now.saturating_duration_since(attempt.at);
+        if age > KEPT_ATTEMPTS {
+            break;
+        }
+        if attempt.source != source {
+            if age <= WINDOW {
+                load.other_30s += 1;
+            }
+            continue;
+        }
+        load.attempts_300s += 1;
+        if age <= WINDOW {
+            load.attempts_30s += 1;
+            if attempt.status == 429 {
+                load.limited_30s += 1;
+            }
+        }
+        if attempt.status == 429 && load.since_last_429.is_none() {
+            load.since_last_429 = Some(age);
+        }
+    }
+    load
+}
+
+struct RouteStats {
+    source: ApiSource,
+    method: &'static str,
+    endpoint: &'static str,
+    count: usize,
+    limited: usize,
+    errors: usize,
+    max_ms: u32,
+    sum_ms: u64,
+}
+
+/// Which grant and endpoint used Spotify's window, for `api.budget`.
+fn report_budget() {
+    let now = Instant::now();
+    let mut grants = [0usize; 2];
+    let mut limited = [0usize; 2];
+    let mut routes: Vec<RouteStats> = Vec::new();
+    {
+        let attempts = ATTEMPTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for attempt in attempts
+            .iter()
+            .rev()
+            .take_while(|attempt| now.saturating_duration_since(attempt.at) <= WINDOW)
+        {
+            let index = grant_index(attempt.source);
+            grants[index] += 1;
+            let is_limited = attempt.status == 429;
+            let is_error = attempt.status == 0 || attempt.status >= 500;
+            if is_limited {
+                limited[index] += 1;
+            }
+            let position = routes.iter().position(|route| {
+                route.source == attempt.source
+                    && route.method == attempt.method
+                    && route.endpoint == attempt.endpoint
+            });
+            let route = match position {
+                Some(position) => &mut routes[position],
+                None => {
+                    routes.push(RouteStats {
+                        source: attempt.source,
+                        method: attempt.method,
+                        endpoint: attempt.endpoint,
+                        count: 0,
+                        limited: 0,
+                        errors: 0,
+                        max_ms: 0,
+                        sum_ms: 0,
+                    });
+                    let last = routes.len() - 1;
+                    &mut routes[last]
+                }
+            };
+            route.count += 1;
+            route.limited += usize::from(is_limited);
+            route.errors += usize::from(is_error);
+            route.max_ms = route.max_ms.max(attempt.ms);
+            route.sum_ms += u64::from(attempt.ms);
+        }
+    }
+    routes.sort_by_key(|route| std::cmp::Reverse(route.count));
+    let top: Vec<Value> = routes
+        .iter()
+        .take(12)
+        .map(|route| {
+            json!({
+                "route": format!("{} {} {}", grant_name(route.source), route.method, route.endpoint),
+                "n": route.count,
+                "n429": route.limited,
+                "errors": route.errors,
+                "max_ms": route.max_ms,
+                "avg_ms": route.sum_ms / route.count.max(1) as u64
+            })
+        })
+        .collect();
+    telemetry::event("api.budget")
+        .field("window_s", WINDOW.as_secs())
+        .field("shared_30s", grants[0])
+        .field("personal_30s", grants[1])
+        .field("shared_429_30s", limited[0])
+        .field("personal_429_30s", limited[1])
+        .field("routes", top)
+        .emit();
+}
+
+/// Telemetry's view of one client, read without taking its locks.
+struct ClientProbe {
+    generation: u64,
+    /// The cooldown deadline on [`clock_ms`], mirrored from the lock.
+    cooldown_until_ms: AtomicU64,
+    episode_started_ms: AtomicU64,
+    episode_limited: AtomicU64,
+    episode_waited: AtomicU64,
+    permit_waiters: AtomicUsize,
+}
+
+impl ClientProbe {
+    fn new() -> Self {
+        Self {
+            generation: GENERATION.fetch_add(1, Ordering::Relaxed) + 1,
+            cooldown_until_ms: AtomicU64::new(0),
+            episode_started_ms: AtomicU64::new(0),
+            episode_limited: AtomicU64::new(0),
+            episode_waited: AtomicU64::new(0),
+            permit_waiters: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Counts a request queued for a permit, even if its future is dropped.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// What a response said about itself, captured before its body is read.
+#[derive(Default)]
+struct Reply {
+    version: Option<String>,
+    family: Option<&'static str>,
+    retry_after: Option<String>,
+    upstream_ms: Option<u64>,
+    rate_headers: Option<String>,
+}
+
+fn reply_info(response: &reqwest::Response) -> Reply {
+    let headers = response.headers();
+    let retry_after = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.chars().take(40).collect::<String>());
+    let upstream_ms = headers
+        .get("x-envoy-upstream-service-time")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    let rate: Vec<String> = headers
+        .iter()
+        .filter(|(name, _)| {
+            let name = name.as_str();
+            name.contains("ratelimit") || name.contains("rate-limit")
+        })
+        .filter_map(|(name, value)| {
+            let value = value.to_str().ok()?;
+            (value.len() <= 64).then(|| format!("{}={value}", name.as_str()))
+        })
+        .collect();
+    Reply {
+        version: Some(format!("{:?}", response.version())),
+        family: response
+            .remote_addr()
+            .map(|address| if address.is_ipv4() { "v4" } else { "v6" }),
+        retry_after,
+        upstream_ms,
+        rate_headers: (!rate.is_empty()).then(|| rate.join("; ")),
+    }
+}
+
+/// One logical request as telemetry sees it.
+struct RequestProbe<'a> {
+    client: &'a ApiClient,
+    live: bool,
+    method: &'static str,
+    endpoint: &'static str,
+    caller: Option<&'static str>,
+    query: Option<String>,
+    q_len: Option<usize>,
+    uris: Option<usize>,
+    device: Option<String>,
+    req_bytes: Option<usize>,
+    queue_write: bool,
+    started: Instant,
+    attempt: u32,
+    phase: &'static str,
+    attempt_started: Instant,
+    phase_started: Instant,
+    cooldown_wait: Duration,
+    permit_wait: Duration,
+    token_wait: Duration,
+    token_lock: Duration,
+    cooldown_at_entry_ms: u64,
+    sent_at: Option<Instant>,
+    sent_in_cooldown: bool,
+    in_flight: usize,
+    waiters: usize,
+    idle_before_ms: Option<u64>,
+    ttfb: Option<Duration>,
+    reply: Reply,
+    /// The user's action behind a player command, to time it end to end.
+    intent: Option<telemetry::Intent>,
+    finished: bool,
+}
+
+/// The intents a player command carries out, for correlation.
+fn intent_actions(method: &str, endpoint: &str) -> &'static [&'static str] {
+    match (method, endpoint) {
+        ("POST", "/me/player/next") => &["next"],
+        ("POST", "/me/player/previous") => &["previous"],
+        ("PUT", "/me/player/play") => &["play", "toggle", "play_item"],
+        ("PUT", "/me/player/pause") => &["pause", "toggle"],
+        ("PUT", "/me/player/seek") => &["seek"],
+        ("PUT", "/me/player/volume") => &["volume"],
+        ("PUT", "/me/player/shuffle") => &["shuffle"],
+        ("PUT", "/me/player/repeat") => &["repeat"],
+        ("POST", "/me/player/queue") => &["queue_add"],
+        ("PUT", "/me/player") => &["transfer"],
+        _ => &[],
+    }
+}
+
+impl<'a> RequestProbe<'a> {
+    fn new(
+        client: &'a ApiClient,
+        method: &Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+        jpeg: Option<&str>,
+        queue_write: bool,
+    ) -> Self {
+        let now = Instant::now();
+        let live = telemetry::enabled();
+        let mut probe = Self {
+            client,
+            live,
+            method: method_name(method),
+            endpoint: template(path),
+            caller: CALLER.try_with(|caller| *caller).ok(),
+            query: None,
+            q_len: None,
+            uris: None,
+            device: None,
+            req_bytes: None,
+            queue_write,
+            started: now,
+            attempt: 0,
+            phase: "cooldown",
+            attempt_started: now,
+            phase_started: now,
+            cooldown_wait: Duration::ZERO,
+            permit_wait: Duration::ZERO,
+            token_wait: Duration::ZERO,
+            token_lock: Duration::ZERO,
+            cooldown_at_entry_ms: 0,
+            sent_at: None,
+            sent_in_cooldown: false,
+            in_flight: 0,
+            waiters: 0,
+            idle_before_ms: None,
+            ttfb: None,
+            reply: Reply::default(),
+            intent: None,
+            finished: false,
+        };
+        if !live {
+            return probe;
+        }
+        let actions = intent_actions(probe.method, probe.endpoint);
+        if !actions.is_empty() {
+            probe.intent = telemetry::recent_intent(actions, Duration::from_secs(10));
+        }
+        probe.query = query_summary(query);
+        probe.q_len = query
+            .iter()
+            .find(|(key, _)| *key == "q")
+            .map(|(_, value)| value.chars().count());
+        probe.uris = query
+            .iter()
+            .find(|(key, _)| *key == "uris" || *key == "uri")
+            .map(|(key, value)| {
+                if *key == "uri" {
+                    1
+                } else {
+                    value.split(',').count()
+                }
+            })
+            .or_else(|| {
+                body.and_then(|body| body.get("uris"))
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+            });
+        // A digest, so commands aimed at one device group without naming it.
+        probe.device = query
+            .iter()
+            .find(|(key, _)| *key == "device_id")
+            .map(|(_, value)| telemetry::digest(value));
+        probe.req_bytes = jpeg
+            .map(str::len)
+            .or_else(|| body.map(|body| body.to_string().len()));
+        if let Some(gap) = repeat_gap(request_key(probe.method, path, query)) {
+            meters::REPEATS.incr();
+            telemetry::crumb("api.repeat")
+                .field("grant", grant_name(client.source))
+                .field("method", probe.method)
+                .field("path_template", probe.endpoint)
+                .field("caller", probe.caller)
+                .field("query", probe.query.clone())
+                .ms("gap_ms", gap)
+                .emit();
+        }
+        probe
+    }
+
+    fn begin(&mut self, attempt: u32) {
+        let now = Instant::now();
+        self.attempt = attempt;
+        self.phase = "cooldown";
+        self.attempt_started = now;
+        self.phase_started = now;
+        self.cooldown_wait = Duration::ZERO;
+        self.permit_wait = Duration::ZERO;
+        self.token_wait = Duration::ZERO;
+        self.token_lock = Duration::ZERO;
+        self.cooldown_at_entry_ms = self.client.cooldown_remaining_ms();
+        self.sent_at = None;
+        self.sent_in_cooldown = false;
+        self.in_flight = 0;
+        self.waiters = 0;
+        self.idle_before_ms = None;
+        self.ttfb = None;
+        self.reply = Reply::default();
+    }
+
+    fn enter(&mut self, phase: &'static str) {
+        self.phase = phase;
+        self.phase_started = Instant::now();
+    }
+
+    fn cooled(&mut self) {
+        self.cooldown_wait = self.phase_started.elapsed();
+        if self.cooldown_wait >= Duration::from_millis(5) {
+            self.client
+                .probe
+                .episode_waited
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.enter("permit");
+    }
+
+    fn permitted(&mut self) {
+        self.permit_wait = self.phase_started.elapsed();
+        self.enter("token");
+    }
+
+    fn tokened(&mut self, lock: Duration) {
+        self.token_wait = self.phase_started.elapsed();
+        self.token_lock = lock;
+        self.enter("send");
+    }
+
+    fn sending(&mut self) {
+        let now = Instant::now();
+        let client = self.client;
+        self.sent_at = Some(now);
+        // Sent while the grant is cooling down: it passed the cooldown check
+        // and then queued for a permit or the token while a 429 arrived.
+        self.sent_in_cooldown = client.cooldown_remaining_ms() > 0;
+        if self.sent_in_cooldown {
+            meters::SENT_IN_COOLDOWN.incr();
+        }
+        self.in_flight = MAX_IN_FLIGHT.saturating_sub(client.limiter.available_permits());
+        self.waiters = client.probe.permit_waiters.load(Ordering::Relaxed);
+        meters::IN_FLIGHT.raise(self.in_flight as i64);
+        meters::WAITERS.raise(self.waiters as i64);
+        meters::PENDING.raise(client.activity.in_flight.load(Ordering::SeqCst) as i64);
+        let waited = self.cooldown_wait + self.permit_wait + self.token_wait;
+        meters::WAIT_MAX_MS.raise(waited.as_millis() as i64);
+        let now_ms = clock_ms();
+        let last = LAST_SENT_MS[grant_index(client.source)].swap(now_ms, Ordering::Relaxed);
+        self.idle_before_ms = (last != 0).then_some(now_ms.saturating_sub(last));
+    }
+
+    fn answered(&mut self, response: &reqwest::Response) {
+        self.ttfb = self.sent_at.map(|at| at.elapsed());
+        if self.live {
+            self.reply = reply_info(response);
+        }
+        self.enter("body");
+    }
+
+    /// A request error: `status` when the headers arrived and the body did not.
+    fn failed(&mut self, status: Option<u16>, error: &reqwest::Error) {
+        let class = crate::http::error_class(error);
+        if status.is_none() {
+            meters::NETWORK_ERRORS.incr();
+        }
+        if error.is_timeout() {
+            meters::TIMEOUTS.incr();
+        }
+        let outcome = if status.is_some() {
+            "body_failed"
+        } else {
+            "network"
+        };
+        self.finish(outcome, status, None, |event| {
+            event
+                .field("error_kind", class)
+                .field_with("io_kind", || crate::http::io_kind(error))
+                .field_with("cause", || {
+                    crate::http::root_cause(error).map(|cause| telemetry::scrub(&cause))
+                })
+        });
+    }
+
+    fn finish(
+        &mut self,
+        outcome: &'static str,
+        status: Option<u16>,
+        resp_bytes: Option<usize>,
+        extra: impl FnOnce(telemetry::Event) -> telemetry::Event,
+    ) {
+        self.finished = true;
+        self.report(outcome, status, resp_bytes, extra);
+    }
+
+    /// Emits `api.request` for the attempt now ending.
+    fn report(
+        &mut self,
+        outcome: &'static str,
+        status: Option<u16>,
+        resp_bytes: Option<usize>,
+        extra: impl FnOnce(telemetry::Event) -> telemetry::Event,
+    ) {
+        let source = self.client.source;
+        let wire = self.sent_at.take().map(|at| at.elapsed());
+        if wire.is_some() {
+            match source {
+                ApiSource::Shared => meters::ATTEMPTS_SHARED.incr(),
+                ApiSource::Personal => meters::ATTEMPTS_PERSONAL.incr(),
+            }
+        }
+        match status {
+            Some(429) => match source {
+                ApiSource::Shared => meters::LIMITED_SHARED.incr(),
+                ApiSource::Personal => meters::LIMITED_PERSONAL.incr(),
+            },
+            Some(401) => meters::UNAUTHORIZED.incr(),
+            Some(status) if status >= 500 => meters::SERVER_ERRORS.incr(),
+            Some(status) if status >= 400 => meters::CLIENT_ERRORS.incr(),
+            _ => {}
+        }
+        if outcome == "cancelled" {
+            meters::CANCELLED.incr();
+        }
+        if let Some(bytes) = resp_bytes {
+            meters::RESPONSE_BYTES.add(bytes as u64);
+        }
+        if let Some(wire) = wire {
+            meters::LATENCY_MAX_MS.raise(wire.as_millis() as i64);
+        }
+        if !self.live {
+            return;
+        }
+        let load = wire.map(|wire| {
+            note_attempt(
+                source,
+                self.method,
+                self.endpoint,
+                status.unwrap_or(0),
+                wire,
+            )
+        });
+        if let Some(load) = &load {
+            match source {
+                ApiSource::Shared => meters::RATE_SHARED.raise(load.grant as i64),
+                ApiSource::Personal => meters::RATE_PERSONAL.raise(load.grant as i64),
+            }
+        }
+        // A successful player command always ships. A failure ships the
+        // first time its grant, route and outcome are seen in a minute;
+        // repeats are details, still counted above. A request dropped before
+        // it was sent (a superseded search keystroke) is a detail unless it
+        // was parked for a while.
+        let flooded = load
+            .as_ref()
+            .is_some_and(|load| load.last_second > FLOOD_PER_SECOND);
+        let quiet = match outcome {
+            "ok" => flooded && !self.endpoint.starts_with("/me/player"),
+            "cancelled" if wire.is_none() && self.started.elapsed() < Duration::from_secs(1) => {
+                true
+            }
+            _ => !first_failure(source, self.method, self.endpoint, outcome),
+        };
+        let record = if quiet {
+            telemetry::crumb("api.request")
+        } else {
+            telemetry::event("api.request")
+        };
+        let record = record
+            .field("grant", grant_name(source))
+            .field("method", self.method)
+            .field("path_template", self.endpoint)
+            .field("caller", self.caller)
+            .field("attempt", self.attempt)
+            .field("outcome", outcome)
+            .field("status", status)
+            .field("phase", (outcome == "cancelled").then_some(self.phase))
+            .ms("attempt_ms", self.attempt_started.elapsed())
+            .ms("total_ms", self.started.elapsed())
+            .field("wire_ms", wire.map(telemetry::duration_ms))
+            .field("ttfb_ms", self.ttfb.map(telemetry::duration_ms))
+            .ms("cooldown_wait_ms", self.cooldown_wait)
+            .ms("permit_wait_ms", self.permit_wait)
+            .ms("token_wait_ms", self.token_wait)
+            .ms("token_lock_ms", self.token_lock)
+            .field(
+                "cooldown_at_entry_ms",
+                (self.cooldown_at_entry_ms > 0).then_some(self.cooldown_at_entry_ms),
+            )
+            .field("sent_in_cooldown", self.sent_in_cooldown)
+            .field("in_flight", self.in_flight)
+            .field("waiters", self.waiters)
+            .field("idle_before_ms", self.idle_before_ms)
+            .field("http_version", self.reply.version.clone())
+            .field("ip_family", self.reply.family)
+            .field("upstream_ms", self.reply.upstream_ms)
+            .field(
+                "retry_after_raw",
+                self.reply.retry_after.as_deref().map(telemetry::scrub),
+            )
+            .field("resp_bytes", resp_bytes)
+            .field("req_bytes", self.req_bytes)
+            .field("query", self.query.clone())
+            .field("q_len", self.q_len)
+            .field("uris_count", self.uris)
+            .field("device", self.device.clone())
+            .field("queue_write", self.queue_write.then_some(true))
+            .field("rolling_30s_grant", load.as_ref().map(|load| load.grant))
+            .field(
+                "rolling_30s_endpoint",
+                load.as_ref().map(|load| load.endpoint),
+            )
+            .field("rolling_30s_429", load.as_ref().map(|load| load.limited))
+            .field("client_generation", self.client.probe.generation)
+            .field_with("intent_id", || {
+                self.intent.as_ref().map(|intent| intent.id.clone())
+            })
+            .field_with("intent_action", || {
+                self.intent.as_ref().map(|intent| intent.action)
+            })
+            .field_with("intent_source", || {
+                self.intent.as_ref().map(|intent| intent.source)
+            })
+            .field_with("since_intent_ms", || {
+                self.intent
+                    .as_ref()
+                    .map(|intent| telemetry::duration_ms(intent.at.elapsed()))
+            });
+        let record = match &self.reply.rate_headers {
+            Some(headers) => record.text("ratelimit_headers", headers),
+            None => record,
+        };
+        extra(record).emit();
+        // A dead pooled connection after sleep or a network change answers
+        // only when the 30 s client timeout fires.
+        if let Some(wire) = wire.filter(|wire| *wire >= STUCK_AFTER) {
+            telemetry::anomaly("api.stuck")
+                .field("grant", grant_name(source))
+                .field("method", self.method)
+                .field("path_template", self.endpoint)
+                .field("caller", self.caller)
+                .field("outcome", outcome)
+                .field("status", status)
+                .ms("wire_ms", wire)
+                .field("ttfb_ms", self.ttfb.map(telemetry::duration_ms))
+                .field("idle_before_ms", self.idle_before_ms)
+                .field("http_version", self.reply.version.clone())
+                .field("ip_family", self.reply.family)
+                .emit();
+        }
+        if let Some(status) = status.filter(|status| *status != 429) {
+            self.client.end_cooldown_episode(status);
+        }
+        if BUDGET.ready(WINDOW) {
+            report_budget();
+        }
+    }
+
+    /// A 429: the attempt, the `api.rate_limited` anomaly with the cooldown
+    /// it causes, and a suspicion of load from outside this process.
+    /// `applied` is `None` for an exhausted quota, which sets no cooldown.
+    /// Past an episode's start the anomaly is a crumb between throttled
+    /// reports, as is a repeated `api.quota_exhausted`.
+    fn rate_limited(
+        &mut self,
+        asked: Duration,
+        applied: Option<Duration>,
+        body: &str,
+        before_ms: u64,
+        gave_up: bool,
+    ) {
+        let client = self.client;
+        let source = client.source;
+        let quota = applied.is_none();
+        let after_ms = client.cooldown_remaining_ms();
+        if !quota {
+            match source {
+                ApiSource::Shared => meters::COOLDOWN_SHARED_MS.raise(after_ms as i64),
+                ApiSource::Personal => meters::COOLDOWN_PERSONAL_MS.raise(after_ms as i64),
+            }
+        }
+        // Read before this attempt joins the window.
+        let load = if self.live {
+            grant_load(source)
+        } else {
+            GrantLoad::default()
+        };
+        let raw = self.reply.retry_after.clone();
+        let kind = retry_after_kind(raw.as_deref());
+        let reason = if self.live { error_reason(body) } else { None };
+        let applied_ms = applied.map(telemetry::duration_ms);
+        let capped = applied.is_some_and(|applied| applied < asked);
+        let outcome = if quota {
+            "quota_exhausted"
+        } else if gave_up {
+            "rate_limited_gave_up"
+        } else {
+            "rate_limited"
+        };
+        let attempt_reason = reason.clone();
+        self.report(outcome, Some(429), Some(body.len()), |event| {
+            event
+                .field("retry_after_kind", kind)
+                .field("retry_after_s", asked.as_secs())
+                .field("applied_wait_ms", applied_ms)
+                .field("capped", capped)
+                .field("reason", attempt_reason)
+        });
+        if !self.live {
+            return;
+        }
+        let route = format!("{} {} {}", grant_name(source), self.method, self.endpoint);
+        telemetry::note_cause("webapi:rate_limited", route.as_str());
+        let probe = &client.probe;
+        let episode = if quota {
+            None
+        } else if probe
+            .episode_started_ms
+            .compare_exchange(0, clock_ms(), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some("start")
+        } else {
+            Some("extend")
+        };
+        let limited_in_episode =
+            (!quota).then(|| probe.episode_limited.fetch_add(1, Ordering::Relaxed) + 1);
+        let first_in_window = load.since_last_429.is_none_or(|gap| gap > WINDOW);
+        let external = first_in_window && load.attempts_30s < EXTERNAL_BELOW;
+        let index = grant_index(source);
+        let alarm = if quota {
+            QUOTA_REPORT[index].ready(QUOTA_EVERY)
+        } else {
+            // Taken at an episode's start too, so the start counts toward it.
+            let ready = RATE_LIMITED_REPORT[index].ready(RATE_LIMITED_EVERY);
+            ready || episode == Some("start")
+        };
+        let record = if alarm {
+            telemetry::anomaly("api.rate_limited")
+        } else {
+            telemetry::crumb("api.rate_limited")
+        };
+        record
+            .field("grant", grant_name(source))
+            .field("method", self.method)
+            .field("path_template", self.endpoint)
+            .field("caller", self.caller)
+            .field("attempt", self.attempt)
+            .field("retry_after_raw", raw.as_deref().map(telemetry::scrub))
+            .field("retry_after_kind", kind)
+            .field("retry_after_s", asked.as_secs())
+            .field("applied_wait_ms", applied_ms)
+            .field("capped", capped)
+            .field("queue_write", self.queue_write)
+            .field("quota_exhausted", quota)
+            .field("reason", reason.clone())
+            .field("gave_up", gave_up)
+            .field("cooldown_before_ms", before_ms)
+            .field("cooldown_after_ms", after_ms)
+            .field("episode", episode)
+            .field("limited_in_episode", limited_in_episode)
+            .field("sent_in_cooldown", self.sent_in_cooldown)
+            .field("in_flight", self.in_flight)
+            .field("waiters", self.waiters)
+            .field("attempts_30s", load.attempts_30s)
+            .field("attempts_300s", load.attempts_300s)
+            .field("limited_30s", load.limited_30s)
+            .field("other_grant_30s", load.other_30s)
+            .field(
+                "since_last_429_ms",
+                load.since_last_429.map(telemetry::duration_ms),
+            )
+            .field("first_in_window", first_in_window)
+            .field("external_suspected", external)
+            .field("client_generation", probe.generation)
+            .emit();
+        if external {
+            telemetry::anomaly("api.rate_limited_externally")
+                .field("grant", grant_name(source))
+                .field("method", self.method)
+                .field("path_template", self.endpoint)
+                .field("attempts_30s", load.attempts_30s)
+                .field("attempts_300s", load.attempts_300s)
+                .field("other_grant_30s", load.other_30s)
+                .field("retry_after_s", asked.as_secs())
+                .field("quota_exhausted", quota)
+                .emit();
+        }
+        if quota {
+            let record = if alarm {
+                telemetry::event("api.quota_exhausted")
+            } else {
+                telemetry::crumb("api.quota_exhausted")
+            };
+            record
+                .field("grant", grant_name(source))
+                .field("method", self.method)
+                .field("path_template", self.endpoint)
+                .field("reason", reason)
+                .field("attempts_300s", load.attempts_300s)
+                .emit();
+        }
+        if let Some(episode) = episode {
+            let record = if episode == "start" {
+                telemetry::event("api.cooldown")
+            } else {
+                telemetry::crumb("api.cooldown")
+            };
+            record
+                .field("phase", episode)
+                .field("grant", grant_name(source))
+                .field("cause_method", self.method)
+                .field("cause_path_template", self.endpoint)
+                .field("wait_ms", applied_ms)
+                .field("before_ms", before_ms)
+                .field("until_ms", after_ms)
+                .field("limited_in_episode", limited_in_episode)
+                .field("client_generation", probe.generation)
+                .emit();
+        }
+    }
+}
+
+impl Drop for RequestProbe<'_> {
+    fn drop(&mut self) {
+        // The future was dropped before an answer: aborted, superseded, or
+        // raced by something else.
+        if !self.finished {
+            self.finished = true;
+            self.report("cancelled", None, None, |event| event);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1472,6 +2869,40 @@ mod tests {
             resumed.body(),
             json!({ "uris": ["spotify:track:b"], "position_ms": 42_000 })
         );
+    }
+
+    #[test]
+    fn telemetry_reports_templates_and_safe_query_keys_only() {
+        assert_eq!(
+            template("/playlists/37i9dQZF1DXcBWIGoYBM5M/items"),
+            "/playlists/{id}/items"
+        );
+        assert_eq!(
+            template("https://api.spotify.com/v1/albums/4aawyAB9vmqN3uQ7FjRGTy/tracks?offset=50"),
+            "/albums/{id}/tracks"
+        );
+        assert_eq!(template("/me/player/next"), "/me/player/next");
+        assert_eq!(template("/users/someone/playlists"), "other");
+        assert_eq!(
+            query_summary(&[
+                ("q", "a song someone searched".to_string()),
+                ("limit", "20".to_string()),
+                ("uris", "spotify:track:a".to_string()),
+                ("device_id", "a-device".to_string()),
+            ]),
+            Some("limit=20".to_string())
+        );
+        assert_eq!(retry_after_kind(Some("5")), "seconds");
+        assert_eq!(
+            retry_after_kind(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            "http_date"
+        );
+        assert_eq!(retry_after_kind(None), "missing");
+        assert_eq!(
+            error_reason(r#"{"error":{"status":429,"reason":"QUOTA_EXCEEDED"}}"#),
+            Some("QUOTA_EXCEEDED".to_string())
+        );
+        assert_eq!(error_reason(r#"{"error":{"reason":"free text"}}"#), None);
     }
 
     #[test]

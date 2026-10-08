@@ -186,11 +186,39 @@ pub struct ApiGateway {
 impl ApiGateway {
     pub fn new(http: impl Into<crate::http::Http>, activity: Arc<NetActivity>) -> Self {
         let http = http.into();
+        crate::telemetry::set_context("personal_app", false);
         Self {
             shared: Session::new(http.clone(), activity.clone(), ApiProfile::SHARED),
             personal: Session::new(http, activity, ApiProfile::PERSONAL),
             playlist_access: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Reports a grant's state change. Losing the personal grant moves all
+    /// of its traffic to the shared app; an Authorizing grant parks requests.
+    fn report_state(&self, source: ApiSource, from: Option<&str>, reason: &'static str) {
+        if !crate::telemetry::enabled() {
+            return;
+        }
+        let session = self.session(source);
+        let (generation, to) = {
+            let state = session.state.borrow();
+            (state.0, state_name(&state.1))
+        };
+        crate::telemetry::set_context("personal_app", self.personal_ready());
+        crate::telemetry::event("api.grant_state")
+            .field("grant", source.to_string())
+            .field("from", from)
+            .field("to", to)
+            .field("reason", reason)
+            .field("generation", generation)
+            .field("client_generation", session.client().telemetry_generation())
+            .field("personal_ready", self.personal_ready())
+            .emit();
+    }
+
+    fn state_before(&self, source: ApiSource) -> Option<&'static str> {
+        crate::telemetry::enabled().then(|| state_name(&self.state(source)))
     }
 
     fn session(&self, source: ApiSource) -> &Session {
@@ -205,7 +233,9 @@ impl ApiGateway {
     }
 
     pub fn set_state(&self, source: ApiSource, state: SessionState) {
+        let from = self.state_before(source);
         self.session(source).set_state(state);
+        self.report_state(source, from, "set");
     }
 
     /// Marks a verified session ready, keeping the token provider that
@@ -215,11 +245,13 @@ impl ApiGateway {
             ApiSource::Shared => ApiSource::Personal,
             ApiSource::Personal => ApiSource::Shared,
         };
+        let from = self.state_before(source);
         if self
             .state(other)
             .account()
             .is_some_and(|active| active != &account)
         {
+            self.report_state(source, from, "install_rejected_other_account");
             return Err(ApiError::Status {
                 status: 403,
                 message: "The Spotify grants belong to different accounts".into(),
@@ -227,10 +259,12 @@ impl ApiGateway {
         }
         self.session(source)
             .set_state(SessionState::Ready { account });
+        self.report_state(source, from, "install");
         Ok(())
     }
 
     pub fn begin_verification(&self, source: ApiSource, provider: TokenProvider) {
+        let from = self.state_before(source);
         let session = self.session(source);
         let client = session.client().for_authorization(provider);
         *session
@@ -238,6 +272,7 @@ impl ApiGateway {
             .write()
             .unwrap_or_else(|lock| lock.into_inner()) = Arc::new(client);
         session.set_state(SessionState::Authorizing);
+        self.report_state(source, from, "begin_verification");
     }
 
     pub fn verification_client(&self, source: ApiSource) -> Arc<ApiClient> {
@@ -245,12 +280,14 @@ impl ApiGateway {
     }
 
     pub fn clear(&self, source: ApiSource) {
+        let from = self.state_before(source);
         let session = self.session(source);
         session.client().set_token_provider(None);
         session.state.send_modify(|current| {
             current.0 += 1;
             current.1 = SessionState::Unavailable;
         });
+        self.report_state(source, from, "clear");
     }
 
     pub fn clear_all(&self) {
@@ -274,18 +311,30 @@ impl ApiGateway {
     }
 
     pub async fn client_for(&self, operation: Operation) -> Result<Arc<ApiClient>, ApiError> {
-        let source = plan(operation, self.personal_ready());
+        let personal_ready = self.personal_ready();
+        let source = plan(operation, personal_ready);
+        let asked = std::time::Instant::now();
         let session = self.session(source);
         let mut state = session.state.subscribe();
         let generation = state.borrow().0;
         loop {
             let (current, status) = state.borrow_and_update().clone();
             if current != generation {
+                report_route(
+                    operation,
+                    source,
+                    personal_ready,
+                    asked,
+                    "generation_changed",
+                );
                 return Err(ApiError::NotSignedIn);
             }
             match status {
                 SessionState::Ready { .. } => break,
-                SessionState::Unavailable => return Err(ApiError::NotSignedIn),
+                SessionState::Unavailable => {
+                    report_route(operation, source, personal_ready, asked, "not_signed_in");
+                    return Err(ApiError::NotSignedIn);
+                }
                 // A personal grant can open the app before the shared grant
                 // finishes verification. Keep shared-only views loading.
                 SessionState::Authorizing => {
@@ -293,6 +342,7 @@ impl ApiGateway {
                 }
             }
         }
+        report_route(operation, source, personal_ready, asked, "ready");
         log::debug!("Spotify route operation={operation:?} source={source}");
         Ok(session.client())
     }
@@ -316,10 +366,20 @@ impl ApiGateway {
             return;
         };
         let access = classify_playlist(&account, playlist);
-        self.playlist_access
+        let previous = self
+            .playlist_access
             .lock()
             .unwrap_or_else(|lock| lock.into_inner())
             .insert(PlaylistId::new(playlist.id.clone()), access);
+        // Only a change: a library page observes every playlist on it.
+        if let Some(previous) = previous.filter(|previous| *previous != access) {
+            crate::telemetry::crumb("api.playlist_access")
+                .field("playlist", playlist.id.as_str())
+                .field_with("from", || format!("{previous:?}"))
+                .field_with("to", || format!("{access:?}"))
+                .field("cause", "observed")
+                .emit();
+        }
     }
 
     pub fn observe_playlists<'a>(&self, playlists: impl IntoIterator<Item = &'a Playlist>) {
@@ -329,11 +389,51 @@ impl ApiGateway {
     }
 
     pub fn invalidate_playlist_access(&self, id: &PlaylistId) {
-        self.playlist_access
+        let previous = self
+            .playlist_access
             .lock()
             .unwrap_or_else(|lock| lock.into_inner())
             .insert(id.clone(), PlaylistAccess::Unknown);
+        // A 403 sends the playlist's reads and writes back to the shared app.
+        crate::telemetry::event("api.playlist_access")
+            .field("playlist", id.as_str())
+            .field_with("from", || previous.map(|previous| format!("{previous:?}")))
+            .field("to", "Unknown")
+            .field("cause", "forbidden")
+            .emit();
     }
+}
+
+fn state_name(state: &SessionState) -> &'static str {
+    match state {
+        SessionState::Unavailable => "unavailable",
+        SessionState::Authorizing => "authorizing",
+        SessionState::Ready { .. } => "ready",
+    }
+}
+
+/// Which grant served an operation, and how long it waited for that grant
+/// to finish verification. A long park ships; the rest stay as crumbs.
+fn report_route(
+    operation: Operation,
+    source: ApiSource,
+    personal_ready: bool,
+    asked: std::time::Instant,
+    outcome: &'static str,
+) {
+    let waited = asked.elapsed();
+    let record = if waited >= std::time::Duration::from_millis(500) {
+        crate::telemetry::event("api.route")
+    } else {
+        crate::telemetry::crumb("api.route")
+    };
+    record
+        .field_with("operation", || format!("{operation:?}"))
+        .field("grant", source.to_string())
+        .field("personal_ready", personal_ready)
+        .field("outcome", outcome)
+        .ms("route_wait_ms", waited)
+        .emit();
 }
 
 #[cfg(test)]

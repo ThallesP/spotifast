@@ -50,6 +50,9 @@ struct Change {
 struct Refresh {
     rows: PagedList<SavedTrack>,
     through: usize,
+    /// For telemetry: a refresh walks every loaded page again.
+    started: std::time::Instant,
+    pages: u32,
 }
 
 #[derive(Default)]
@@ -89,10 +92,19 @@ impl LikedSongs {
     }
 
     pub fn start_refresh(&mut self, generation: u64) {
+        if let Some(previous) = &self.refresh {
+            crate::telemetry::crumb("app.liked_refresh")
+                .field("outcome", "superseded")
+                .field("pages", previous.pages)
+                .since("ms", previous.started)
+                .emit();
+        }
         self.generation = generation;
         self.refresh = Some(Refresh {
             rows: PagedList::default(),
             through: self.server.items.len().max(50),
+            started: std::time::Instant::now(),
+            pages: 0,
         });
     }
 
@@ -118,10 +130,22 @@ impl LikedSongs {
     pub fn absorb(&mut self, offset: u32, page: Page<SavedTrack>, now: i64) -> bool {
         if let Some(refresh) = &mut self.refresh {
             refresh.rows.absorb(offset, page);
+            refresh.pages = refresh.pages.saturating_add(1);
             if refresh.rows.items.len() < refresh.through && refresh.rows.next_offset.is_some() {
                 return true;
             }
+            let (pages, started, through) = (refresh.pages, refresh.started, refresh.through);
             self.server = self.refresh.take().expect("refresh exists").rows;
+            crate::telemetry::event("app.liked_refresh")
+                .field("outcome", "done")
+                .field("pages", pages)
+                .field("through", through)
+                .field("rows", self.server.items.len())
+                .field("total", self.server.total)
+                .field("complete", self.server.is_complete())
+                .field("generation", self.generation)
+                .since("ms", started)
+                .emit();
             self.refreshed_at = now;
             self.saved_through = None;
             let complete = self.server.is_complete();
@@ -142,6 +166,14 @@ impl LikedSongs {
     }
 
     pub fn fail(&mut self, error: String) {
+        if let Some(refresh) = &self.refresh {
+            crate::telemetry::event("app.liked_refresh")
+                .field("outcome", "failed")
+                .field("pages", refresh.pages)
+                .text("error", &error)
+                .since("ms", refresh.started)
+                .emit();
+        }
         self.refresh = None;
         self.server.fail(error);
     }

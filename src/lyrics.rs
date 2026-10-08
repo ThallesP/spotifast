@@ -9,7 +9,7 @@
 //! title.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -103,12 +103,17 @@ pub fn from_spotify(json: &serde_json::Value) -> Option<Lyrics> {
 
 /// The cached answer at `path`, while it is fresh.
 pub fn cached(path: &Path) -> Option<Option<Lyrics>> {
-    read_cache(&path.to_path_buf())
+    let started = Instant::now();
+    let cached = read_cache(&path.to_path_buf());
+    note_cache_io(started);
+    cached
 }
 
 /// Remember an answer at `path`, `None` included.
 pub fn store(path: &Path, found: &Option<Lyrics>) {
+    let started = Instant::now();
     write_cache(path, found);
+    note_cache_io(started);
 }
 
 /// Fetches lyrics for `query`, using the disk cache when available.
@@ -117,13 +122,93 @@ pub async fn fetch(
     cache_dir: &Path,
     query: &Query,
 ) -> Result<Option<Lyrics>> {
+    register_meters();
+    let started = Instant::now();
     let cache_path = cache_dir.join(format!("{}.json", cache_key(query)));
     if let Some(cached) = read_cache(&cache_path) {
+        note_cache_io(started);
+        meters::CACHE_HITS.incr();
+        crate::telemetry::crumb("api.lyrics_fetch")
+            .field("provider", "lrclib")
+            .field("cache", "hit")
+            .field("found", found_kind(&cached))
+            .since("ms", started)
+            .emit();
         return Ok(cached);
     }
-    let found = lookup(http, query).await?;
+    let cache_read = started.elapsed();
+    note_cache_io(started);
+    let found = lookup(http, query).await.inspect_err(|error| {
+        crate::telemetry::crumb("api.lyrics_fetch")
+            .field("provider", "lrclib")
+            .field("cache", "miss")
+            .field("outcome", "error")
+            // The outermost context only: the chain below it names the URL
+            // and its query, the song being played.
+            .text("error", &error.to_string())
+            .since("ms", started)
+            .emit();
+    })?;
+    let written = Instant::now();
     write_cache(&cache_path, &found);
+    note_cache_io(written);
+    crate::telemetry::crumb("api.lyrics_fetch")
+        .field("provider", "lrclib")
+        .field("cache", "miss")
+        .field("outcome", "ok")
+        .field("found", found_kind(&found))
+        .ms("cache_read_ms", cache_read)
+        .ms("cache_write_ms", written.elapsed())
+        .since("ms", started)
+        .emit();
     Ok(found)
+}
+
+mod meters {
+    use crate::telemetry::{Counter, Gauge};
+
+    pub static REQUESTS: Counter = Counter::new("api_lyrics_requests");
+    pub static ERRORS: Counter = Counter::new("api_lyrics_errors");
+    pub static CACHE_HITS: Counter = Counter::new("api_lyrics_cache_hits");
+    /// Cache reads and writes are synchronous file I/O on a runtime worker.
+    pub static CACHE_IO_MAX_MS: Gauge = Gauge::peak("api_lyrics_cache_io_max_ms");
+    pub static REQUEST_MAX_MS: Gauge = Gauge::peak("api_lyrics_request_max_ms");
+}
+
+fn register_meters() {
+    crate::telemetry::register_counters(&[&meters::REQUESTS, &meters::ERRORS, &meters::CACHE_HITS]);
+    crate::telemetry::register_gauges(&[&meters::CACHE_IO_MAX_MS, &meters::REQUEST_MAX_MS]);
+}
+
+fn note_cache_io(started: Instant) {
+    meters::CACHE_IO_MAX_MS.raise(started.elapsed().as_millis() as i64);
+}
+
+fn found_kind(found: &Option<Lyrics>) -> &'static str {
+    match found {
+        None => "none",
+        Some(lyrics) if lyrics.instrumental => "instrumental",
+        Some(lyrics) if lyrics.synced => "synced",
+        Some(_) => "plain",
+    }
+}
+
+/// One LRCLIB request, for telemetry. Never its parameters: they name the
+/// song being played.
+fn note_request(path: &str, started: Instant, status: Option<u16>, outcome: &'static str) {
+    let took = started.elapsed();
+    meters::REQUESTS.incr();
+    meters::REQUEST_MAX_MS.raise(took.as_millis() as i64);
+    if !matches!(outcome, "ok" | "not_found") {
+        meters::ERRORS.incr();
+    }
+    crate::telemetry::crumb("api.lyrics")
+        .field("provider", "lrclib")
+        .field("path", path)
+        .field("status", status)
+        .field("outcome", outcome)
+        .ms("ms", took)
+        .emit();
 }
 
 async fn lookup(http: &reqwest::Client, query: &Query) -> Result<Option<Lyrics>> {
@@ -168,26 +253,34 @@ async fn get<T: DeserializeOwned>(
     path: &str,
     params: &[(&str, &str)],
 ) -> Result<Option<T>> {
+    let started = Instant::now();
     let response = http
         .get(format!("{API}{path}"))
         .query(params)
         .header("Accept", "application/json")
         .send()
         .await
+        .inspect_err(|error| {
+            note_request(path, started, None, crate::http::error_class(error));
+        })
         .context("cannot reach LRCLIB")?;
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::BAD_REQUEST {
+        note_request(path, started, Some(status.as_u16()), "not_found");
         return Ok(None);
     }
     if !status.is_success() {
+        note_request(path, started, Some(status.as_u16()), "status");
         anyhow::bail!("LRCLIB answered {status}");
     }
-    Ok(Some(
-        response
-            .json()
-            .await
-            .context("unexpected answer from LRCLIB")?,
-    ))
+    let answer = response.json::<T>().await;
+    note_request(
+        path,
+        started,
+        Some(status.as_u16()),
+        if answer.is_ok() { "ok" } else { "decode" },
+    );
+    Ok(Some(answer.context("unexpected answer from LRCLIB")?))
 }
 
 #[derive(Debug, Default, Deserialize)]

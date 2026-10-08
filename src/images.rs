@@ -57,6 +57,14 @@ pub struct ArtLoader {
 impl ArtLoader {
     pub fn new(http: impl Into<Http>, runtime: tokio::runtime::Handle, cache_dir: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&cache_dir);
+        crate::telemetry::register_counters(&[
+            &meters::MEMORY_HITS,
+            &meters::DISK_HITS,
+            &meters::NETWORK_FETCHES,
+            &meters::NETWORK_BYTES,
+            &meters::ERRORS,
+        ]);
+        crate::telemetry::register_gauges(&[&meters::IN_FLIGHT, &meters::FETCH_MAX_MS]);
         Self {
             inner: Arc::new(Inner {
                 entries: Mutex::new(HashMap::new()),
@@ -241,6 +249,7 @@ impl Inner {
             .unwrap_or_else(|p| p.into_inner())
             .get(url)
         {
+            meters::MEMORY_HITS.incr();
             return Ok(Arc::clone(bytes));
         }
         let path = self.cache_path(url);
@@ -252,22 +261,32 @@ impl Inner {
         .ok()
         .flatten();
         let bytes: Arc<[u8]> = match cached {
-            Some(bytes) if !bytes.is_empty() => Arc::from(bytes),
+            Some(bytes) if !bytes.is_empty() => {
+                meters::DISK_HITS.incr();
+                Arc::from(bytes)
+            }
             _ => {
-                let response = self
-                    .http
-                    .client()?
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(|error| error.to_string())?;
+                // Artwork shares the HTTP client, the runtime and the link
+                // with the Web API and librespot's audio downloads.
+                let fetch = NetworkFetch::start(url);
+                let response = self.http.client()?.get(url).send().await.map_err(|error| {
+                    fetch.failed(crate::http::error_class(&error), None);
+                    error.to_string()
+                })?;
                 if !response.status().is_success() {
+                    fetch.failed("status", Some(response.status().as_u16()));
                     return Err(format!("artwork request failed: {}", response.status()));
                 }
-                let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+                let status = response.status().as_u16();
+                let bytes = response.bytes().await.map_err(|error| {
+                    fetch.failed(crate::http::error_class(&error), Some(status));
+                    error.to_string()
+                })?;
                 if bytes.len() > MAX_ART_BYTES {
+                    fetch.failed("too_large", Some(status));
                     return Err("artwork is too large".to_string());
                 }
+                fetch.done(bytes.len());
                 // The loader and file worker share one immutable payload.
                 let bytes: Arc<[u8]> = Arc::from(bytes.as_ref());
                 let write_path = path.clone();
@@ -395,6 +414,104 @@ impl BytesLoader for ArtLoader {
                 _ => 0,
             })
             .sum()
+    }
+}
+
+mod meters {
+    use crate::telemetry::{Counter, Gauge};
+
+    pub static MEMORY_HITS: Counter = Counter::new("api_art_memory_hits");
+    pub static DISK_HITS: Counter = Counter::new("api_art_disk_hits");
+    pub static NETWORK_FETCHES: Counter = Counter::new("api_art_network_fetches");
+    pub static NETWORK_BYTES: Counter = Counter::new("api_art_bytes");
+    pub static ERRORS: Counter = Counter::new("api_art_errors");
+    pub static IN_FLIGHT: Gauge = Gauge::peak("api_art_in_flight_peak");
+    pub static FETCH_MAX_MS: Gauge = Gauge::peak("api_art_fetch_max_ms");
+}
+
+/// Artwork downloads under way. Nothing limits them, so a scroll through a
+/// long list can start dozens at once.
+static ART_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ART_BURST: crate::telemetry::Throttle = crate::telemetry::Throttle::new();
+static ART_SAMPLE: crate::telemetry::Throttle = crate::telemetry::Throttle::new();
+const ART_BURST_ABOVE: usize = 16;
+
+/// One artwork download, for telemetry: counts it in flight until dropped.
+struct NetworkFetch {
+    host: &'static str,
+    started: Instant,
+    in_flight: usize,
+}
+
+impl NetworkFetch {
+    fn start(url: &str) -> Self {
+        use std::sync::atomic::Ordering;
+        let in_flight = ART_IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+        meters::IN_FLIGHT.raise(in_flight as i64);
+        if in_flight > ART_BURST_ABOVE && ART_BURST.ready(Duration::from_secs(5)) {
+            crate::telemetry::crumb("api.art_burst")
+                .field("in_flight", in_flight)
+                .emit();
+        }
+        Self {
+            host: art_host(url),
+            started: Instant::now(),
+            in_flight,
+        }
+    }
+
+    fn done(&self, bytes: usize) {
+        meters::NETWORK_FETCHES.incr();
+        meters::NETWORK_BYTES.add(bytes as u64);
+        let took = self.started.elapsed();
+        meters::FETCH_MAX_MS.raise(took.as_millis() as i64);
+        // Slow ones always; the rest sampled, so a scroll does not fill
+        // the flight recorder.
+        if took >= Duration::from_millis(500) || ART_SAMPLE.ready(Duration::from_secs(2)) {
+            self.report("ok", None, Some(bytes));
+        }
+    }
+
+    fn failed(&self, outcome: &'static str, status: Option<u16>) {
+        meters::NETWORK_FETCHES.incr();
+        meters::ERRORS.incr();
+        self.report(outcome, status, None);
+    }
+
+    fn report(&self, outcome: &'static str, status: Option<u16>, bytes: Option<usize>) {
+        crate::telemetry::crumb("api.art_fetch")
+            .field("host", self.host)
+            .field("outcome", outcome)
+            .field("status", status)
+            .field("bytes", bytes)
+            .field("in_flight", self.in_flight)
+            .since("ms", self.started)
+            .emit();
+    }
+}
+
+impl Drop for NetworkFetch {
+    fn drop(&mut self) {
+        ART_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The artwork host, from a fixed set: never the path, which names the
+/// cover being viewed.
+fn art_host(url: &str) -> &'static str {
+    let host = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .unwrap_or("");
+    match host {
+        "i.scdn.co" => "i.scdn.co",
+        "mosaic.scdn.co" => "mosaic.scdn.co",
+        "image-cdn-ak.spotifycdn.com" => "image-cdn-ak.spotifycdn.com",
+        "image-cdn-fa.spotifycdn.com" => "image-cdn-fa.spotifycdn.com",
+        host if host.ends_with(".spotifycdn.com") => "spotifycdn.com",
+        host if host.ends_with(".scdn.co") => "scdn.co",
+        _ => "other",
     }
 }
 

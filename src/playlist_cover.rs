@@ -67,6 +67,10 @@ pub fn read(path: &Path) -> Result<Cover, String> {
 }
 
 pub fn prepare(bytes: &[u8]) -> Result<Cover, String> {
+    // Reported when dropped, so every early return is timed too.
+    let mut span = crate::telemetry::crumb_span("app.cover_prepare")
+        .field("input_bytes", bytes.len())
+        .field("ok", false);
     let image = bounded_decode(bytes)?;
     // Preserve the entire image and its aspect ratio. Flatten transparency
     // onto white because JPEG has no alpha channel.
@@ -88,6 +92,10 @@ pub fn prepare(bytes: &[u8]) -> Result<Cover, String> {
                 .map_err(|_| "Couldn't encode this image. Try another file.")?;
             let encoded = STANDARD.encode(&jpeg);
             if encoded.len() <= MAX_PAYLOAD {
+                span.set("ok", true);
+                span.set("size", size);
+                span.set("quality", quality);
+                span.set("payload_bytes", encoded.len());
                 use sha2::{Digest, Sha256};
                 let uri = format!("bytes://playlist-cover-{:x}.jpg", Sha256::digest(&jpeg));
                 return Ok(Cover {
