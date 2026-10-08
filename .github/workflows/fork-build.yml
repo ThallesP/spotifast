@@ -1,0 +1,95 @@
+name: Fork build
+
+# A personal update channel for forks: each push to main (or a manual run)
+# builds an Apple silicon Spotifast.app, wraps it in a disk image and
+# publishes it as this fork's latest release. A copy installed from one of
+# these images updates itself from the next through the built-in updater.
+#
+# These builds are ad-hoc signed and not notarized. The first one is
+# installed by hand; see "Testing changes in a fork" in PACKAGING.md.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-build
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: Apple silicon app
+    # Official releases come from release.yml; this channel is for forks.
+    if: github.repository != 'crmne/spotifast'
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - run: rustup target add aarch64-apple-darwin
+      # Unlike release.yml, test builds reuse compiled dependencies: only
+      # this fork's workflows write the cache, and a fast loop is the point.
+      - uses: Swatinem/rust-cache@v2
+
+      # The updater offers only a plain version above the running one, so
+      # each build takes the next patch after both Cargo.toml and this fork's
+      # latest release, skipping any tag that already exists (forks inherit
+      # the upstream tags). The bump stays out of git so main keeps merging
+      # cleanly from upstream.
+      - name: Next version
+        id: version
+        run: |
+          current="$(sed -n 's/^version = "\([0-9.]*\).*"$/\1/p' Cargo.toml | head -n 1)"
+          latest="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)"
+          IFS=. read -r major minor patch <<<"$current"
+          if [[ "$latest" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            next=(${BASH_REMATCH[1]} ${BASH_REMATCH[2]} $((BASH_REMATCH[3] + 1)))
+            if ((next[0] > major || (next[0] == major && (next[1] > minor || (next[1] == minor && next[2] > patch))))); then
+              major=${next[0]} minor=${next[1]} patch=${next[2]}
+            fi
+          fi
+          while git ls-remote --exit-code --tags origin "refs/tags/v$major.$minor.$patch" >/dev/null; do
+            patch=$((patch + 1))
+          done
+          version="$major.$minor.$patch"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "Building $version"
+          sed -i '' "1,/^version = /s/^version = .*/version = \"$version\"/" Cargo.toml
+
+      - name: Build
+        env:
+          SPOTIFAST_UPDATE_REPOSITORY: ${{ github.repository }}
+          SPOTIFAST_UPDATE_ARM64_ONLY: "1"
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          version="$(target/aarch64-apple-darwin/release/spotifast --version)"
+          test "$version" = "spotifast ${{ steps.version.outputs.version }}"
+
+      - name: Disk image
+        run: |
+          tag="v${{ steps.version.outputs.version }}"
+          mkdir -p dist/input
+          bash packaging/macos/bundle.sh target/aarch64-apple-darwin/release/spotifast \
+            dist/input/Spotifast.app "${{ steps.version.outputs.version }}"
+          cp README.md LICENSE dist/input/
+          ruby packaging/macos/dmg.rb dist/input "dist/spotifast-$tag-macos-arm64.dmg"
+          rm -rf dist/input
+          python3 packaging/release-names.py dist "$tag"
+
+      - name: Publish
+        run: |
+          tag="v${{ steps.version.outputs.version }}"
+          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Spotifast $tag (fork build)" --latest \
+            --notes "Apple silicon test build of $GITHUB_SHA on $GITHUB_REF_NAME."

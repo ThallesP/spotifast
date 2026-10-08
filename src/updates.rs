@@ -10,7 +10,21 @@ pub use fastframe_update::{
     CHECK_INTERVAL, DownloadState, Installation, Kind, Prepared, Release, Source, Unsupported,
     Updater,
 };
-use fastframe_update::{MacConfig, ReqwestTransport, UpdateConfig};
+use fastframe_update::{MacConfig, MacTarget, ReqwestTransport, UpdateConfig};
+
+/// The repository whose releases this build updates from. A fork's own
+/// builds set `SPOTIFAST_UPDATE_REPOSITORY` to follow that fork's releases.
+const REPOSITORY: &str = match option_env!("SPOTIFAST_UPDATE_REPOSITORY") {
+    Some(repository) => repository,
+    None => "crmne/spotifast",
+};
+
+/// Official releases carry a universal disk image. A build made with
+/// `SPOTIFAST_UPDATE_ARM64_ONLY` set expects Apple silicon images instead.
+const MAC_TARGET: MacTarget = match option_env!("SPOTIFAST_UPDATE_ARM64_ONLY") {
+    Some(_) => MacTarget::Arm64Only,
+    None => MacTarget::Universal,
+};
 
 pub const CONFIG: UpdateConfig = UpdateConfig {
     macos: MacConfig {
@@ -22,8 +36,9 @@ pub const CONFIG: UpdateConfig = UpdateConfig {
     // signed. Only a version shipped after the first signed release may
     // carry the key: from then on an unsigned release is refused.
     publisher_key: None,
+    mac_target: MAC_TARGET,
     ..UpdateConfig::new(
-        "crmne/spotifast",
+        REPOSITORY,
         "Spotifast",
         "spotifast",
         env!("CARGO_PKG_VERSION"),

@@ -156,3 +156,38 @@ their original signatures; this setup does not replace release assets.
 `packaging/release-names.py DIST TAG` checks the release's `spotifast-`
 downloads and writes their checksums. Run `python3 packaging/test-release-names.py`
 when changing this step. Published historical downloads are never rewritten.
+
+## Testing changes in a fork
+
+A fork can deliver its own builds to a Mac through the built-in updater.
+`.github/workflows/fork-build.yml` runs on every push to a fork's `main` (and
+from the Actions tab). It builds an Apple silicon app, publishes
+`spotifast-vX.Y.Z-macos-arm64.dmg` with its `checksums.txt` as the fork's
+latest release, and takes the next patch version each time so the updater
+always sees something newer. The version bump is not committed. The workflow
+never runs in `crmne/spotifast`.
+
+Two build-time variables point the updater at the fork:
+`SPOTIFAST_UPDATE_REPOSITORY=owner/name` names the repository whose releases
+it follows, and `SPOTIFAST_UPDATE_ARM64_ONLY=1` makes it expect the Apple
+silicon disk image. Builds without them follow the official releases.
+
+Enable Actions on the fork once (forks start with them off). Then install the
+first build by hand, replacing any official or Homebrew copy, because the
+updater refuses an update signed by a different publisher than the running
+app:
+
+```sh
+brew uninstall --cask spotifast 2>/dev/null || true
+dir="$(mktemp -d)"
+gh release download --repo OWNER/spotifast --pattern '*.dmg' --dir "$dir"
+hdiutil attach "$dir"/*.dmg -nobrowse -mountpoint "$dir/mnt"
+rm -rf /Applications/Spotifast.app && ditto "$dir/mnt/Spotifast.app" /Applications/Spotifast.app
+hdiutil detach "$dir/mnt" && rm -rf "$dir"
+```
+
+`gh` does not mark the download as quarantined, so macOS opens the ad-hoc
+signed app without a Gatekeeper prompt. After that, push to `main`, wait for
+the workflow, and use Check for updates in Settings. Because each build has a
+new ad-hoc signature, macOS may ask once per update whether Spotifast may
+use its saved keychain item; choose Always Allow.
