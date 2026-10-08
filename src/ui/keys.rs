@@ -22,11 +22,26 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     // A focused song row still takes Ctrl+arrow to change songs; a text
     // field uses those keys to move its caret.
     let editing_text = ctx.text_edit_focused();
-    let mut actions = Vec::new();
+    // Each action with whether its key was the keyboard's auto-repeat, which
+    // telemetry reports: a held Space toggles twice.
+    let mut actions: Vec<(Action, bool)> = Vec::new();
+    let telemetry = crate::telemetry::enabled();
     ctx.input_mut(|input| {
         let mut key = |modifiers: Modifiers, key: Key, action: Action| {
+            let repeat = telemetry
+                && input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: pressed_key,
+                            pressed: true,
+                            repeat: true,
+                            ..
+                        } if *pressed_key == key
+                    )
+                });
             if input.consume_key(modifiers, key) {
-                actions.push(action);
+                actions.push((action, repeat));
             }
         };
         // egui ignores an extra Shift when it matches, so a Shift shortcut
@@ -132,10 +147,10 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::B))
         && let Some(now) = app.now_playing().filter(|now| !now.is_episode)
     {
-        actions.push(Action::ToggleSaved(now.uri));
+        actions.push((Action::ToggleSaved(now.uri), false));
     }
     // Resolve the "open current artist/album" placeholders.
-    for action in actions {
+    for (action, repeat) in actions {
         match action {
             Action::OpenUri(kind) if kind == "artist" => {
                 if let Some(id) = app
@@ -154,7 +169,9 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
                     }
                 }
             }
-            other => app.actions.push(other),
+            other => {
+                app.push_tagged_action(other, "keyboard", None, repeat.then_some("key_repeat"))
+            }
         }
     }
     // Map mouse back and forward buttons to navigation.

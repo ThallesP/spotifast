@@ -427,11 +427,22 @@ pub(crate) fn run() -> eframe::Result<()> {
         })
         .unwrap_or(dirs);
     let dirs_ready = dirs.ensure();
+    // Opt-in diagnostics for a personal build (src/telemetry.rs): nothing
+    // happens without an Axiom token in telemetry.json or the environment.
+    let telemetry = spotifast::telemetry::Config::load(&dirs.config);
+    let default_filter = match &telemetry {
+        Some(_) => format!(
+            "{default_filter},{}",
+            spotifast::telemetry::LOG_FILTER_EXTRA
+        ),
+        None => default_filter.to_owned(),
+    };
     // Launched from a desktop, stderr goes nowhere; keep the run's log where
     // a bug report can find it, and a line per panic in the panic log (with
     // any link in its message removed: a URL can carry a token).
     if let Err(error) = fastframe_log::Logging::new("spotifast", env!("CARGO_PKG_VERSION"))
         .filter(default_filter)
+        .redact(spotifast::telemetry::log_tap)
         .file(dirs.log_file())
         .panic_log(dirs.panic_log())
         .panic_message(fastframe_log::PanicMessage::Redacted(
@@ -445,6 +456,13 @@ pub(crate) fn run() -> eframe::Result<()> {
         log::warn!("unable to create the application directories: {error}");
     }
     let mut settings = settings::Settings::load(&dirs.settings_file());
+    if telemetry.is_some() {
+        // As App::new resolves it: an invalid proxy holds uploads too.
+        let proxy = settings
+            .proxy_config()
+            .unwrap_or_else(spotifast::settings::ProxyConfig::Invalid);
+        spotifast::telemetry::init(telemetry, &proxy, &dirs.state);
+    }
     if let Some(name) = cli.device_name {
         settings.device_name = name;
     }
@@ -542,7 +560,7 @@ pub(crate) fn run() -> eframe::Result<()> {
     spotifast::window::set_fixed_size(demo_inner.is_some());
     #[cfg(feature = "demo")]
     let demo_storage = app.dirs.cache.join("demo-window.ron");
-    fastframe_shell::Shell::new(app, &waker)
+    let result = fastframe_shell::Shell::new(app, &waker)
         .idle(fastframe_tray::idle)
         .run(|lease| {
             #[cfg(windows)]
@@ -647,6 +665,8 @@ pub(crate) fn run() -> eframe::Result<()> {
                         persist_memory,
                         #[cfg(windows)]
                         thumbbar,
+                        #[cfg(target_os = "macos")]
+                        last_menu_skip: None,
                         #[cfg(feature = "demo")]
                         shot: creator_shot.clone(),
                         #[cfg(feature = "demo")]
@@ -666,7 +686,12 @@ pub(crate) fn run() -> eframe::Result<()> {
                     spotifast::window::report_missing_opengl(locale);
                 }
             })
-        })
+        });
+    spotifast::telemetry::event("app.exit")
+        .field("ok", result.is_ok())
+        .emit();
+    spotifast::telemetry::shutdown(std::time::Duration::from_secs(2));
+    result
 }
 
 /// The Winamp mini player's window, when that is the window to open.
@@ -1109,6 +1134,10 @@ struct Shell {
     persist_memory: bool,
     #[cfg(windows)]
     thumbbar: spotifast::thumbbar::ThumbBar,
+    /// The last Next or Previous from the menu and when, for telemetry to
+    /// tell a held key equivalent's repeats.
+    #[cfg(target_os = "macos")]
+    last_menu_skip: Option<(spotifast::mac_menu::MenuCommand, std::time::Instant)>,
     /// A pending `--demo-shot` capture, if this is a screenshot run.
     #[cfg(feature = "demo")]
     shot: Option<Shot>,
@@ -1236,6 +1265,8 @@ impl eframe::App for Shell {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Slow and hung frames, for telemetry; inert when it is off.
+        let _frame_timer = spotifast::telemetry::frame();
         let app = &mut *self.app;
         #[cfg(target_os = "macos")]
         for command in spotifast::mac_menu::drain_commands() {
@@ -1293,12 +1324,27 @@ impl eframe::App for Shell {
                     continue;
                 }
             };
-            app.actions.push(action);
+            // The menu bar and its key equivalents, such as Cmd+Right. A held
+            // key equivalent repeats Next or Previous; tag it as a repeat so
+            // telemetry throttles it as it does a held key in the window.
+            let skip = matches!(command, MenuCommand::Next | MenuCommand::Previous);
+            let repeat = skip
+                && self.last_menu_skip.is_some_and(|(last, at)| {
+                    last == command && at.elapsed() < std::time::Duration::from_millis(250)
+                });
+            if skip {
+                self.last_menu_skip = Some((command, std::time::Instant::now()));
+            }
+            if repeat {
+                app.push_tagged_action(action, "menu", None, Some("key_repeat"));
+            } else {
+                app.push_action_from(action, "menu");
+            }
         }
         #[cfg(windows)]
         for command in self.thumbbar.drain_commands() {
             if let Some(action) = command.action(&app.thumb_state(false)) {
-                app.actions.push(action);
+                app.push_action_from(action, "system");
             }
         }
         app.background_frame(ctx);
@@ -1310,6 +1356,8 @@ impl eframe::App for Shell {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // The rest of the frame `logic` counted.
+        let _frame_timer = spotifast::telemetry::frame_part();
         let app = &mut *self.app;
         app.frame_ui(ui);
         if let Some(receipt) = app.update_receipt.take() {

@@ -65,6 +65,127 @@ const QUEUE_ADD_DEBOUNCE: Duration = Duration::from_millis(1500);
 const RECENT_CONTEXTS_KEPT: usize = 60;
 const CONTAINS_BATCH: usize = 40;
 
+/// What the telemetry heartbeat counts here, registered in `App::new`, and
+/// the throttles of the reports that could otherwise repeat.
+mod counters {
+    use crate::telemetry::{Counter, Gauge, Throttle};
+
+    pub(super) static POLL_PLAYBACK: Counter = Counter::new("app_poll_playback");
+    pub(super) static POLL_DEVICES: Counter = Counter::new("app_poll_devices");
+    pub(super) static POLL_QUEUE: Counter = Counter::new("app_poll_queue");
+    pub(super) static DEVICES_FORCED: Counter = Counter::new("app_devices_forced");
+    pub(super) static LIKED_REFRESHES: Counter = Counter::new("app_liked_refreshes");
+    pub(super) static TRACK_REQUESTS: Counter = Counter::new("app_track_requests");
+    pub(super) static RESUME_TRACK_REQUESTS: Counter = Counter::new("app_resume_track_requests");
+    pub(super) static CONTAINS_REQUESTS: Counter = Counter::new("app_contains_requests");
+    pub(super) static NOW_PLAYING_CHANGES: Counter = Counter::new("app_now_playing_changes");
+    pub(super) static QUEUE_STALE: Counter = Counter::new("queue_stale_rejected");
+    pub(super) static QUEUE_SUPERSEDED: Counter = Counter::new("queue_superseded");
+    pub(super) static STALE_ANSWERS: Counter = Counter::new("ui_stale_answers");
+    pub(super) static MEDIA_COMMANDS: Counter = Counter::new("input_media_commands");
+    pub(super) static CONTROL_COMMANDS: Counter = Counter::new("input_control_commands");
+    pub(super) static BACKEND_EVENTS: Counter = Counter::new("app_backend_events");
+    pub(super) static ACTIONS: Counter = Counter::new("app_actions");
+    pub(super) static HEADLESS_TICKS: Counter = Counter::new("app_headless_ticks");
+    pub(super) static MEDIA_STATE_FLIPS: Counter = Counter::new("app_media_state_flips");
+
+    pub(super) static EVENT_BATCH_PEAK: Gauge = Gauge::peak("app_event_batch_peak");
+    pub(super) static ACTION_MAX_US: Gauge = Gauge::peak("app_action_max_us");
+    pub(super) static HEADLESS_GAP_MAX_MS: Gauge = Gauge::peak("app_headless_gap_max_ms");
+
+    pub(super) static VOLUME_INTENTS: Throttle = Throttle::new();
+    pub(super) static POLL_FAILURES: Throttle = Throttle::new();
+    pub(super) static QUEUE_FAILURES: Throttle = Throttle::new();
+    pub(super) static TRACK_FAILURES: Throttle = Throttle::new();
+    pub(super) static RESUME_CONTEXT: Throttle = Throttle::new();
+    pub(super) static NAME_COLLISIONS: Throttle = Throttle::new();
+    pub(super) static HEADLESS_LATE: Throttle = Throttle::new();
+    pub(super) static KEY_REPEATS: Throttle = Throttle::new();
+    pub(super) static KEY_REPEAT_TOGGLES: Throttle = Throttle::new();
+    pub(super) static RESUME_TRACK_FAILURES: Throttle = Throttle::new();
+
+    /// Telemetry's uptime when the system last handed over a media command,
+    /// 0 once read: how long the command waited for a pass to read it.
+    pub(super) static MEDIA_COMMAND_AT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    pub(super) fn register() {
+        crate::telemetry::register_counters(&[
+            &POLL_PLAYBACK,
+            &POLL_DEVICES,
+            &POLL_QUEUE,
+            &DEVICES_FORCED,
+            &LIKED_REFRESHES,
+            &TRACK_REQUESTS,
+            &RESUME_TRACK_REQUESTS,
+            &CONTAINS_REQUESTS,
+            &NOW_PLAYING_CHANGES,
+            &QUEUE_STALE,
+            &QUEUE_SUPERSEDED,
+            &STALE_ANSWERS,
+            &MEDIA_COMMANDS,
+            &CONTROL_COMMANDS,
+            &BACKEND_EVENTS,
+            &ACTIONS,
+            &HEADLESS_TICKS,
+            &MEDIA_STATE_FLIPS,
+        ]);
+        crate::telemetry::register_gauges(&[
+            &EVENT_BATCH_PEAK,
+            &ACTION_MAX_US,
+            &HEADLESS_GAP_MAX_MS,
+        ]);
+    }
+}
+
+/// Where a playback action came from, so its telemetry intent names the
+/// surface: a shortcut, a media key, the tray. Untagged actions come from
+/// the window being drawn.
+struct ActionTag {
+    /// The action, as [`playback_action_kind`] names it.
+    kind: &'static str,
+    /// The intent to record, which can say more than `kind`: a media key's
+    /// Pause arrives as a toggle.
+    intent: &'static str,
+    source: &'static str,
+    at: Instant,
+    /// Why it may repeat the action before it: `key_repeat`, or a second
+    /// toggle in one batch of commands.
+    duplicate: Option<&'static str>,
+}
+
+/// The intent of the playback action being applied, and its trace.
+struct AppliedIntent {
+    id: String,
+    source: &'static str,
+    trace: Option<&'static str>,
+}
+
+/// What telemetry remembers between frames. Untouched while it is off.
+#[derive(Default)]
+struct Diagnostics {
+    action_tags: Vec<ActionTag>,
+    applying: Option<AppliedIntent>,
+    /// The source of untagged actions: the window being drawn, or empty.
+    untagged_source: &'static str,
+    last_media_command: Option<Instant>,
+    remote_poll_soon: bool,
+    /// The newest playback poll and when it was sent.
+    remote_poll_sent: Option<(u64, Instant)>,
+    /// Polls in a row that say this device plays while its engine does not.
+    ghost_polls: u8,
+    /// The track and play holds whose expiry was already reported.
+    reported_track_hold: Option<Instant>,
+    reported_play_hold: Option<Instant>,
+    liked_refresh_reason: Option<&'static str>,
+    settings_reported: Option<serde_json::Value>,
+    last_headless: Option<Instant>,
+    auth_status: &'static str,
+    playback_status: &'static str,
+    /// Whether the system's media controls were last told it plays.
+    media_playing: Option<bool>,
+}
+
 pub struct RemoteSnapshot {
     pub state: PlaybackState,
     pub received_at: Instant,
@@ -564,6 +685,7 @@ pub struct App {
     pub winamp: crate::winamp::WinampState,
     /// The spectrum behind the player bar, when that is chosen.
     pub player_bar_analyser: crate::vis::WideAnalyser,
+    diag: Diagnostics,
 }
 
 /// How many plays the Home shelf asks for: it shows sixteen cards.
@@ -614,6 +736,9 @@ impl fastframe_shell::Resident for App {
     /// Audio, MPRIS, the tray and polling keep running until Show or Quit.
     fn headless_frame(&mut self, ctx: &egui::Context) -> fastframe_shell::Headless {
         use fastframe_shell::Headless;
+        // The shell's frame timer never runs without a window.
+        let _frame_timer = crate::telemetry::frame();
+        self.note_headless_tick();
         self.background_frame(ctx);
         if self.quit_requested {
             Headless::Quit
@@ -697,9 +822,17 @@ impl App {
         };
         let session = SessionState::load(&dirs.session_file());
         let wake = waker.clone();
-        let media_controls = options
-            .media_controls
-            .then(|| MediaControls::start(media_app(), move || wake.wake()));
+        let media_controls = options.media_controls.then(|| {
+            MediaControls::start(media_app(), move || {
+                if crate::telemetry::enabled() {
+                    counters::MEDIA_COMMAND_AT.store(
+                        crate::telemetry::uptime_ms().max(1),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                wake.wake();
+            })
+        });
         #[cfg(target_os = "linux")]
         let system_appearance = {
             let wake = waker.clone();
@@ -948,11 +1081,14 @@ impl App {
             update_receipt: None,
             winamp: crate::winamp::WinampState::new(session.winamp_pos, tap, eq),
             player_bar_analyser: crate::vis::WideAnalyser::default(),
+            diag: Diagnostics::default(),
         };
         app.local.volume = app.settings.volume;
         // What was played here is on disk and needs nothing from the
         // network, so the tab has rows before Spotify has answered.
         app.rebuild_recents();
+        counters::register();
+        app.report_settings();
         app
     }
 
@@ -972,6 +1108,11 @@ impl App {
         ctx.set_theme(self.theme_preference());
         self.applied_dark = None;
         self.winamp.forget_textures();
+        crate::telemetry::event("app.window_attached")
+            .field("mini", self.settings.winamp_window)
+            .field("from_tray", self.window_hidden)
+            .emit();
+        self.diag.last_headless = None;
         self.window_hidden = false;
         self.hide_intent = false;
         self.wants_show = false;
@@ -1055,6 +1196,10 @@ impl App {
     /// The window is gone but the process stays: audio, the tray, and the
     /// media controls keep running until Show or Quit.
     pub fn window_gone(&mut self) {
+        crate::telemetry::event("app.window_gone")
+            .field("hides_to_tray", self.hides_to_tray())
+            .field("playing", self.believed_playing())
+            .emit();
         // The Winamp window went with it; it comes back where it was.
         self.winamp.remember_position();
         self.winamp.forget_textures();
@@ -1807,7 +1952,22 @@ impl App {
 
     fn handle_events(&mut self) {
         let events = self.backend.poll();
+        if events.is_empty() || !crate::telemetry::enabled() {
+            self.handle_backend_events(events);
+            return;
+        }
+        let count = events.len();
+        counters::BACKEND_EVENTS.add(count as u64);
+        counters::EVENT_BATCH_PEAK.raise(count as i64);
+        let started = Instant::now();
         self.handle_backend_events(events);
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_millis(16) {
+            crate::telemetry::crumb("app.slow_events")
+                .field("count", count)
+                .ms("duration_ms", elapsed)
+                .emit();
+        }
     }
 
     fn handle_backend_events(&mut self, events: Vec<Event>) {
@@ -1967,7 +2127,14 @@ impl App {
                     Ok(false) => {}
                     Err(error) => log::debug!("album type unavailable for {uri}: {error}"),
                 },
-                Event::WebApp { client_id } => self.web_app = client_id,
+                Event::WebApp { client_id } => {
+                    if client_id.is_some() != self.web_app.is_some() {
+                        crate::telemetry::event("api.personal_app_ready")
+                            .field("ready", client_id.is_some())
+                            .emit();
+                    }
+                    self.web_app = client_id;
+                }
                 Event::UpdateSupport(result) => {
                     if result.is_ok()
                         && self.settings.download_updates_automatically
@@ -2074,6 +2241,19 @@ impl App {
             }
             _ => {}
         }
+        let label = auth_label(&status);
+        if label != self.diag.auth_status && crate::telemetry::enabled() {
+            crate::telemetry::event("ui.status")
+                .field("component", "auth")
+                .field("status", label)
+                .field("previous", self.diag.auth_status)
+                .field_with("error", || match &status {
+                    AuthStatus::Failed(message) => Some(crate::telemetry::scrub(message)),
+                    _ => None,
+                })
+                .emit();
+            self.diag.auth_status = label;
+        }
         self.auth = status;
     }
 
@@ -2102,6 +2282,20 @@ impl App {
                 );
             }
             LocalPlayback::Authorizing | LocalPlayback::Connecting => {}
+        }
+        let label = local_playback_label(&status);
+        if label != self.diag.playback_status && crate::telemetry::enabled() {
+            crate::telemetry::event("ui.status")
+                .field("component", "local_playback")
+                .field("status", label)
+                .field("previous", self.diag.playback_status)
+                .field("play_held", self.queued_play.is_some())
+                .field_with("error", || match &status {
+                    LocalPlayback::Failed(message) => Some(crate::telemetry::scrub(message)),
+                    _ => None,
+                })
+                .emit();
+            self.diag.playback_status = label;
         }
         self.local_playback = status;
     }
@@ -2218,6 +2412,9 @@ impl App {
         let track_changed =
             state.track != self.local.track || state.track_sequence != self.local.track_sequence;
         let reconnected = state.connected && !self.local.connected;
+        if crate::telemetry::enabled() {
+            self.report_local_change(&state, track_changed);
+        }
         if state.shuffle != self.local.shuffle
             && self
                 .shuffle_set_at
@@ -2272,6 +2469,12 @@ impl App {
                 {
                     self.unavailable_at.clear();
                     self.last_unavailable_reconnect = Some(now);
+                    // The reconnect stops and resumes playback on its own.
+                    crate::telemetry::note_cause("app:reconnect", "unavailable_burst");
+                    crate::telemetry::event("ui.banner")
+                        .field("banner", "unavailable_reconnect")
+                        .field("playing", self.believed_playing())
+                        .emit();
                     self.backend.send(Command::Reconnect);
                     self.toast(gettext(
                         self.locale,
@@ -2288,12 +2491,22 @@ impl App {
         ) {
             log::info!("the list ended; playing what Spotify follows {seed} with");
             self.local_list = None;
+            // Nobody pressed anything: the app starts this load itself.
+            if crate::telemetry::enabled() {
+                let id = crate::telemetry::intent("play_item", "system");
+                crate::telemetry::trace_start("play", &id, Duration::from_millis(2000));
+                crate::telemetry::event("playback.autoplay")
+                    .field("intent_id", id.as_str())
+                    .field("seed", uri_class(&seed))
+                    .emit();
+            }
             self.backend.player(PlayerCommand::Load(LoadSpec {
                 context_uri: Some(seed),
                 play: true,
                 autoplay: true,
                 ..LoadSpec::default()
             }));
+            crate::telemetry::trace_mark("play", "action_applied");
         }
         self.local = state;
         if let Some(volume) = held_volume {
@@ -2303,6 +2516,9 @@ impl App {
             self.on_now_playing_changed();
         }
         if reconnected {
+            crate::telemetry::crumb("ui.engine_reconnected")
+                .field("play_held", self.queued_play.is_some())
+                .emit();
             if let Some(request) = self.queued_play.take() {
                 self.play_request(request, false);
             }
@@ -2342,6 +2558,8 @@ impl App {
         if !self.track_requests.insert(id.clone()) {
             return;
         }
+        // Asked again on every pass after a failure, so it is counted.
+        counters::RESUME_TRACK_REQUESTS.incr();
         self.backend.api(ApiRequest::Track { id });
     }
 
@@ -2362,6 +2580,11 @@ impl App {
             return;
         }
         if let Some(page) = Page::decode(&Self::context_page(&context)) {
+            if counters::RESUME_CONTEXT.ready(Duration::from_secs(10)) {
+                crate::telemetry::crumb("app.resume_context_reload")
+                    .field("context", uri_class(&context))
+                    .emit();
+            }
             self.ensure_loaded(page);
         }
     }
@@ -2587,10 +2810,21 @@ impl App {
                 }
             }
         }
+        let candidates_len = candidates.len();
+        let mut sent = 0;
         for id in candidates {
             if self.track_requests.insert(id.clone()) {
                 self.backend.api(ApiRequest::Track { id });
+                sent += 1;
             }
+        }
+        if sent > 0 {
+            counters::TRACK_REQUESTS.add(sent);
+            crate::telemetry::crumb("api.fanout")
+                .field("origin", "recording_candidates")
+                .field("candidates", candidates_len)
+                .field("sent", sent)
+                .emit();
         }
     }
 
@@ -2609,11 +2843,20 @@ impl App {
         let queue_already_updated =
             self.queue_start_pending.take().as_ref() == Some(&self.target());
         let repeating = same_uri && new_occurrence && now.repeat == RepeatMode::Track;
+        // What this change costs in Web API requests, for telemetry.
+        let local = now.local;
+        let is_episode = now.is_episode;
+        let mut resume_adds = 0;
+        let mut track_requested = false;
+        let mut queue_refreshed = false;
+        let mut lyrics_requested = false;
+        let contains_before = counters::CONTAINS_REQUESTS.get();
         // Restore the saved queue only when the remembered track resumes.
         if !self.resume_queue.is_empty() {
             let queued = std::mem::take(&mut self.resume_queue);
             self.session_dirty = true;
             if now.local && self.resume_track.as_deref() == Some(now.uri.as_str()) {
+                resume_adds = queued.len();
                 for uri in queued {
                     self.manual_queue.push(uri.clone());
                     self.backend.api(ApiRequest::AddToQueue {
@@ -2663,6 +2906,8 @@ impl App {
             && self.track_requests.insert(id.clone())
         {
             self.backend.api(ApiRequest::Track { id: id.clone() });
+            counters::TRACK_REQUESTS.incr();
+            track_requested = true;
         }
         self.request_contains(vec![now.uri.clone()]);
         if let Some(url) = now.art_small.or(now.art_url) {
@@ -2673,9 +2918,55 @@ impl App {
             || (self.settings.winamp_window && self.settings.playlist_open)
         {
             self.refresh_queue(true);
+            queue_refreshed = true;
         }
         if self.show_lyrics_panel {
             self.request_lyrics();
+            lyrics_requested = true;
+        }
+        if crate::telemetry::enabled() {
+            counters::NOW_PLAYING_CHANGES.incr();
+            let intent = crate::telemetry::recent_intent(
+                &["next", "previous", "play_item", "transfer"],
+                Duration::from_secs(10),
+            );
+            let reason = if repeating {
+                "repeat"
+            } else if let Some(intent) = &intent {
+                intent.action
+            } else if local {
+                "advance"
+            } else {
+                "remote"
+            };
+            crate::telemetry::event("ui.now_playing_changed")
+                .field("reason", reason)
+                .field("local", local)
+                .field("episode", is_episode)
+                .field("track_sequence", self.local.track_sequence)
+                .field("new_occurrence", new_occurrence)
+                .field("queue_already_updated", queue_already_updated)
+                .field_with("intent_id", || {
+                    intent.as_ref().map(|intent| intent.id.clone())
+                })
+                .field_with("intent_source", || {
+                    intent.as_ref().map(|intent| intent.source)
+                })
+                .field_with("intent_age_ms", || {
+                    intent
+                        .as_ref()
+                        .map(|intent| crate::telemetry::duration_ms(intent.at.elapsed()))
+                })
+                .field("track_requested", track_requested)
+                .field(
+                    "contains_requested",
+                    counters::CONTAINS_REQUESTS.get() != contains_before,
+                )
+                .field("queue_refreshed", queue_refreshed)
+                .field("lyrics_requested", lyrics_requested)
+                .field("resume_queue_adds", resume_adds)
+                .explained(Duration::from_secs(10))
+                .emit();
         }
     }
 
@@ -2752,6 +3043,9 @@ impl App {
         self.toasts
             .retain(|toast| toast.created.elapsed() < TOAST_LIFETIME);
         self.maybe_suggest_personal_app();
+        if crate::telemetry::enabled() {
+            self.report_expired_holds();
+        }
 
         if self.settings.check_for_updates
             && !self.offline
@@ -2801,6 +3095,7 @@ impl App {
             if let Some(due) = self.liked_recheck_at {
                 if Instant::now() >= due && !self.liked_songs.refreshing() {
                     self.liked_recheck_at = None;
+                    self.diag.liked_refresh_reason = Some("after_edit");
                     self.refresh_liked_songs();
                 } else {
                     ctx.request_repaint_after(
@@ -2972,19 +3267,20 @@ impl App {
     /// Applies playback commands received from the MilkDrop window.
     #[cfg(feature = "milkdrop")]
     fn milkdrop_command(&mut self, command: &str) {
+        // The visualiser's window is part of the mini player's surface.
         match command {
-            "previous" => self.actions.push(Action::Previous),
-            "next" => self.actions.push(Action::Next),
-            "play-pause" => self.actions.push(Action::TogglePlay),
-            "mute" => self.actions.push(Action::ToggleMute),
+            "previous" => self.push_action_from(Action::Previous, "winamp"),
+            "next" => self.push_action_from(Action::Next, "winamp"),
+            "play-pause" => self.push_action_from(Action::TogglePlay, "winamp"),
+            "mute" => self.push_action_from(Action::ToggleMute, "winamp"),
             "save-toggle" => {
                 if let Some(now) = self.now_playing().filter(|now| !now.is_episode) {
                     self.actions.push(Action::ToggleSaved(now.uri));
                 }
             }
-            "shuffle" => self.actions.push(Action::ToggleShuffle),
-            "volume-up" => self.actions.push(Action::VolumeBy(5)),
-            "volume-down" => self.actions.push(Action::VolumeBy(-5)),
+            "shuffle" => self.push_action_from(Action::ToggleShuffle, "winamp"),
+            "volume-up" => self.push_action_from(Action::VolumeBy(5), "winamp"),
+            "volume-down" => self.push_action_from(Action::VolumeBy(-5), "winamp"),
             _ => {}
         }
     }
@@ -3052,15 +3348,24 @@ impl App {
         config: crate::settings::ProxyConfig,
         password: Option<crate::credentials::ProxyPassword>,
     ) {
+        let adopted = self.last_proxy_applied == 0;
         if self.last_proxy_applied == 0 {
             self.applied_proxy = config;
         }
+        // Uploads follow the effective proxy, now with its password.
+        crate::telemetry::set_proxy(&self.applied_proxy);
         if !self.proxy_form_edited
             && self.proxy_request == 0
             && let Some(password) = password
         {
             self.settings.restore_proxy_password(&password);
         }
+        crate::telemetry::event("settings.proxy")
+            .field("change", "restored")
+            .field("adopted", adopted)
+            .field("applied", proxy_kind(&self.applied_proxy))
+            .emit();
+        self.report_settings();
     }
 
     fn handle_proxy_password_stored(&mut self) {
@@ -3082,6 +3387,8 @@ impl App {
         let request = self.proxy_request;
         self.pending_proxy_preferences
             .insert(request, self.settings.proxy_preferences());
+        // Applying a proxy can restart local playback.
+        crate::telemetry::note_cause("app:apply_proxy", if sign_in { "sign_in" } else { "apply" });
         self.backend.send(if sign_in {
             Command::SignIn { request, config }
         } else {
@@ -3101,10 +3408,17 @@ impl App {
         if request < self.last_proxy_applied {
             return;
         }
+        crate::telemetry::event("settings.proxy")
+            .field("change", "applied")
+            .field("ok", result.is_ok())
+            .field("applied", proxy_kind(&config))
+            .field_with("restarted", || result.as_ref().ok().copied())
+            .emit();
         match result {
             Ok(restarted) => {
                 self.last_proxy_applied = request;
                 self.applied_proxy = config;
+                crate::telemetry::set_proxy(&self.applied_proxy);
                 self.applied_proxy_preferences = preferences;
                 self.save_settings();
                 if restarted && self.local_ready {
@@ -3140,7 +3454,10 @@ impl App {
         }
         let mut saved = self.settings.clone();
         self.applied_proxy_preferences.apply_to(&mut saved);
+        let started = Instant::now();
         saved.save(&self.dirs.settings_file());
+        report_save("settings", started);
+        self.report_settings();
     }
 
     /// Called at launch or by the local reload command. Construction and window
@@ -3282,7 +3599,7 @@ impl App {
                 Event::Menu(TRAY_QUIT) => Action::Quit,
                 Event::Menu(_) => continue,
             };
-            self.actions.push(action);
+            self.push_action_from(action, "tray");
         }
     }
 
@@ -3291,10 +3608,14 @@ impl App {
     fn handle_dock_menu(&mut self) {
         use crate::mac_menu::MenuCommand;
         for command in crate::mac_menu::drain_dock_commands() {
+            // The Dock's menu counts as a menu; a crumb tells it apart.
+            crate::telemetry::crumb("input.dock_command")
+                .field("window_hidden", self.window_hidden)
+                .emit();
             match command {
-                MenuCommand::PlayPause => self.actions.push(Action::TogglePlay),
-                MenuCommand::Next => self.actions.push(Action::Next),
-                MenuCommand::Previous => self.actions.push(Action::Previous),
+                MenuCommand::PlayPause => self.push_action_from(Action::TogglePlay, "menu"),
+                MenuCommand::Next => self.push_action_from(Action::Next, "menu"),
+                MenuCommand::Previous => self.push_action_from(Action::Previous, "menu"),
                 _ => {}
             }
         }
@@ -3304,7 +3625,7 @@ impl App {
     #[cfg(target_os = "macos")]
     fn handle_notch_commands(&mut self) {
         for command in crate::notch::drain_commands() {
-            self.actions.push(command.action());
+            self.push_action_from(command.action(), "notch");
         }
     }
 
@@ -3314,8 +3635,11 @@ impl App {
         };
         let commands: Vec<ControlCommand> =
             std::mem::take(&mut *queue.lock().unwrap_or_else(|p| p.into_inner()));
+        let batch = commands.len();
+        let mut toggles = 0;
         for command in commands {
             let playing = self.now_playing().is_some_and(|now| now.playing);
+            let name = control_command_name(&command);
             let action = match command {
                 ControlCommand::Show => Some(Action::ShowWindow),
                 ControlCommand::ReloadThemes => Some(Action::ReloadThemes),
@@ -3347,8 +3671,28 @@ impl App {
                 ControlCommand::Transfer(device_id) => Some(Action::Transfer(device_id)),
                 ControlCommand::RefreshDevices => Some(Action::RefreshDevices),
             };
+            counters::CONTROL_COMMANDS.incr();
+            // Widgets poll the `devices` read, which sends one of these each
+            // time: only playback commands are shipped.
+            let playback = action.as_ref().and_then(playback_action_kind).is_some();
+            let record = if playback {
+                crate::telemetry::event("input.control_command")
+            } else {
+                crate::telemetry::crumb("input.control_command")
+            };
+            record
+                .field("command", name)
+                .field("mapped", action.as_ref().map_or("ignored", action_name))
+                .field("batch_len", batch)
+                .field("ui_playing", playing)
+                .emit();
             if let Some(action) = action {
-                self.actions.push(action);
+                // Play and Pause become a toggle decided by what the
+                // interface believed when the batch arrived.
+                let toggle = matches!(action, Action::TogglePlay);
+                let duplicate = (toggle && toggles > 0).then_some("control_batch");
+                toggles += usize::from(toggle);
+                self.push_tagged_action(action, "remote_control", toggle_intent(name), duplicate);
             }
         }
     }
@@ -3357,8 +3701,20 @@ impl App {
         let Some(commands) = self.media_controls.as_ref().map(MediaControls::commands) else {
             return;
         };
-        for command in commands {
+        let batch = commands.len();
+        let mut toggles = 0;
+        let mut names: Vec<&'static str> = Vec::new();
+        // How long the batch waited for this pass: a hidden window's timer
+        // can be stretched by App Nap.
+        let waited_ms = if batch > 0 && crate::telemetry::enabled() {
+            let at = counters::MEDIA_COMMAND_AT.swap(0, std::sync::atomic::Ordering::Relaxed);
+            (at != 0).then(|| crate::telemetry::uptime_ms().saturating_sub(at))
+        } else {
+            None
+        };
+        for (index, command) in commands.into_iter().enumerate() {
             let playing = self.now_playing().is_some_and(|now| now.playing);
+            let name = media_command_name(&command);
             let action = match command {
                 MediaCommand::Play => (!playing).then_some(Action::TogglePlay),
                 MediaCommand::Pause | MediaCommand::Stop => playing.then_some(Action::TogglePlay),
@@ -3393,9 +3749,35 @@ impl App {
                 MediaCommand::Raise => Some(Action::ShowWindow),
                 MediaCommand::Quit => Some(Action::Quit),
             };
-            if let Some(action) = action {
-                self.actions.push(action);
+            if crate::telemetry::enabled() {
+                names.push(name);
+                self.report_media_command(
+                    name,
+                    action.as_ref(),
+                    playing,
+                    (batch, index),
+                    waited_ms,
+                );
             }
+            if let Some(action) = action {
+                // Two pause-like commands in one batch both see the same
+                // `playing` and both toggle.
+                let toggle = matches!(action, Action::TogglePlay);
+                let duplicate = (toggle && toggles > 0).then_some("media_batch");
+                toggles += usize::from(toggle);
+                self.push_tagged_action(action, "media_key", toggle_intent(name), duplicate);
+            }
+        }
+        // A pause and a play in one batch: the second is decided against the
+        // state from before the first, so one of them is lost.
+        if names.len() > 1
+            && names.iter().any(|name| matches!(*name, "pause" | "stop"))
+            && names.contains(&"play")
+        {
+            crate::telemetry::anomaly("input.media_conflict")
+                .field("commands", names)
+                .field("toggles", toggles)
+                .emit();
         }
     }
 
@@ -3505,6 +3887,18 @@ impl App {
             controls.update(state);
         }
         let playing = self.now_playing().is_some_and(|now| now.playing);
+        // What macOS and headsets see; a flip can make them answer.
+        if crate::telemetry::enabled() && self.diag.media_playing != Some(playing) {
+            if self.diag.media_playing.is_some() {
+                counters::MEDIA_STATE_FLIPS.incr();
+            }
+            self.diag.media_playing = Some(playing);
+            crate::telemetry::crumb("app.media_state")
+                .field("playing", playing)
+                .field("loading", self.now_playing().is_some_and(|now| now.loading))
+                .field("engine", playback_label(self.local.playback))
+                .emit();
+        }
         if let Some(tray) = &mut self.tray
             && self.tray_playing != playing
         {
@@ -4114,6 +4508,7 @@ impl App {
             Page::Home => self.load_home(true),
             Page::TopSongs => self.load_top_songs(true),
             Page::LikedSongs => {
+                self.diag.liked_refresh_reason = Some("reload");
                 self.refresh_liked_songs();
                 return;
             }
@@ -4184,16 +4579,44 @@ impl App {
         self.ensure_loaded(page);
     }
 
-    fn poll_remote(&mut self, _immediate: bool) {
+    fn poll_remote(&mut self, immediate: bool) {
         if !self.is_connected() {
             return;
         }
+        let superseding = self.remote_poll_pending;
+        let soon = std::mem::take(&mut self.diag.remote_poll_soon);
         self.remote_poll_pending = true;
         self.remote_polled_at = Instant::now();
         self.remote_poll_seq += 1;
         self.backend.api(ApiRequest::PlaybackState {
             seq: self.remote_poll_seq,
         });
+        counters::POLL_PLAYBACK.incr();
+        if crate::telemetry::enabled() {
+            let previous = self.diag.remote_poll_sent.map(|(_, at)| at.elapsed());
+            self.diag.remote_poll_sent = Some((self.remote_poll_seq, Instant::now()));
+            crate::telemetry::crumb("api.poll")
+                .field("kind", "playback")
+                .field(
+                    "reason",
+                    if immediate {
+                        "immediate"
+                    } else if soon {
+                        "soon"
+                    } else {
+                        "interval"
+                    },
+                )
+                .field("seq", self.remote_poll_seq)
+                .field("superseding", superseding)
+                .field_with("since_last_ms", || {
+                    previous.map(crate::telemetry::duration_ms)
+                })
+                .field("target", target_label(&self.target()))
+                .field("local_active", self.local.is_active())
+                .field("window_hidden", self.window_hidden)
+                .emit();
+        }
     }
 
     fn refresh_devices(&mut self) {
@@ -4202,6 +4625,15 @@ impl App {
         }
         self.devices_loading = true;
         self.backend.api(ApiRequest::Devices);
+        counters::POLL_DEVICES.incr();
+        crate::telemetry::crumb("api.poll")
+            .field("kind", "devices")
+            .field("picker_open", self.show_devices)
+            .field_with("since_last_ms", || {
+                self.devices_fetched_at
+                    .map(|at| crate::telemetry::duration_ms(at.elapsed()))
+            })
+            .emit();
     }
 
     fn refresh_queue(&mut self, force: bool) {
@@ -4219,11 +4651,33 @@ impl App {
         if !matches!(self.queue, Loadable::Loaded(_)) {
             self.queue = Loadable::Loading;
         }
+        let previous = self.queue_fetched_at.map(|at| at.elapsed());
         self.queue_fetched_at = Some(Instant::now());
         self.queue_seq += 1;
         self.backend.api(ApiRequest::Queue {
             seq: self.queue_seq,
         });
+        counters::POLL_QUEUE.incr();
+        crate::telemetry::crumb("api.poll")
+            .field("kind", "queue")
+            .field(
+                "reason",
+                if self.queue_stale_retries > 0 {
+                    "stale_retry"
+                } else if force {
+                    "forced"
+                } else {
+                    "interval"
+                },
+            )
+            .field("seq", self.queue_seq)
+            .field("stale_retries", self.queue_stale_retries)
+            .field("writing", !self.pending_queue_batches.is_empty())
+            .field("panel_open", self.show_queue_panel)
+            .field_with("since_last_ms", || {
+                previous.map(crate::telemetry::duration_ms)
+            })
+            .emit();
     }
 
     /// A chosen row of Next up plays at once, and the rows above it go
@@ -4263,6 +4717,10 @@ impl App {
                 _ => queue.queue.iter().position(|item| item.uri() == uri),
             };
             let Some(position) = position else {
+                crate::telemetry::event("playback.queue_row")
+                    .field("index", index)
+                    .field("found", false)
+                    .emit();
                 self.refresh_queue(true);
                 return;
             };
@@ -4282,11 +4740,13 @@ impl App {
         self.queue_start_pending = Some(self.target());
         self.set_play_pending(vec![uri]);
         self.optimistic_playing = Some((true, Instant::now()));
+        self.report_queue_row(index, skips);
         match self.target() {
             Target::Local => {
                 for _ in 0..skips {
                     self.backend.player(PlayerCommand::Next);
                 }
+                self.trace_applied();
             }
             Target::Remote(device_id) => {
                 // With nothing to act on, one call earns the "pick
@@ -4373,10 +4833,12 @@ impl App {
         }
         self.manual_queue.clear();
         self.pending_queue_adds.clear();
+        let cleared_songs = cleared.len();
         if !cleared.is_empty() {
             self.queue_cleared = Some((cleared, Instant::now()));
         }
         self.backend.player(PlayerCommand::ClearQueue);
+        self.report_queue_mutation("clear", cleared_songs, "local");
         // Refresh to remove queued tracks added by another client.
         self.queue_recheck_at = Some(Instant::now() + QUEUE_RECHECK);
         self.toast(gettext(self.locale, "Queue cleared"));
@@ -4482,8 +4944,13 @@ impl App {
 
     /// Whether a fetched queue predates the latest local change.
     fn queue_fetch_is_stale(&self, fetched: &Queue) -> bool {
+        self.queue_fetch_stale_reason(fetched).is_some()
+    }
+
+    /// Which local change a fetched queue predates, if any.
+    fn queue_fetch_stale_reason(&self, fetched: &Queue) -> Option<&'static str> {
         if self.queue_stale_retries >= QUEUE_STALE_RETRIES {
-            return false;
+            return None;
         }
         // A recent play or pop must be reflected in the fetched current row.
         if let Some(intent) = &self.intent_track
@@ -4493,7 +4960,7 @@ impl App {
                 .as_ref()
                 .is_none_or(|item| item.uri() != intent.uri)
         {
-            return true;
+            return Some("track_intent");
         }
         // For local playback, reject a fetched current row that differs from
         // the engine's current track.
@@ -4504,7 +4971,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|item| item.uri() != track.uri)
         {
-            return true;
+            return Some("local_track");
         }
         // A cleared row still on top means the clear has not landed yet.
         if let Some((cleared, at)) = &self.queue_cleared
@@ -4514,7 +4981,7 @@ impl App {
                 .first()
                 .is_some_and(|item| cleared.contains(item.uri()))
         {
-            return true;
+            return Some("cleared");
         }
         // An unchanged context order right after toggling shuffle means the
         // reordered queue has not landed yet.
@@ -4531,7 +4998,7 @@ impl App {
                     .map(|item| item.uri())
                     .eq(pending.context_uris.iter().map(String::as_str))
             {
-                return true;
+                return Some("shuffle");
             }
         }
         // A local reorder or positional insert is optimistic; reject a
@@ -4545,9 +5012,9 @@ impl App {
                 .map(|item| item.uri())
                 .eq(self.manual_queue.iter().map(String::as_str))
         {
-            return true;
+            return Some("reorder");
         }
-        false
+        None
     }
 
     fn run_search(&mut self, query: String) {
@@ -4654,10 +5121,12 @@ impl App {
                 self.backend.api(ApiRequest::Contains {
                     uris: std::mem::take(&mut batch),
                 });
+                counters::CONTAINS_REQUESTS.incr();
             }
         }
         if !batch.is_empty() {
             self.backend.api(ApiRequest::Contains { uris: batch });
+            counters::CONTAINS_REQUESTS.incr();
         }
     }
 
@@ -4869,6 +5338,9 @@ impl App {
                     Ok(devices) => {
                         self.devices = devices;
                         self.control_devices_stale = true;
+                        if crate::telemetry::enabled() {
+                            self.report_devices();
+                        }
                         if let Some((name, since)) = self.pending_transfer_to.clone() {
                             let matching = self
                                 .devices
@@ -4903,6 +5375,10 @@ impl App {
             ApiResponse::PlaybackState { seq, result } => {
                 if seq != self.remote_poll_seq {
                     // An older poll finishing late describes the past.
+                    stale_answer("remote_poll")
+                        .field("polls_behind", self.remote_poll_seq.saturating_sub(seq))
+                        .field("ok", result.is_ok())
+                        .emit();
                     return;
                 }
                 self.remote_poll_pending = false;
@@ -4935,6 +5411,11 @@ impl App {
                         {
                             // Accept shuffle changes from another device.
                             self.shuffle_wanted = current;
+                            // A lagging poll about this device can flip it too.
+                            crate::telemetry::event("ui.remote_shuffle_adopted")
+                                .field("shuffle", current)
+                                .field_with("device_is_local", || self.remote_device_is_local())
+                                .emit();
                         }
                         if let Some(context) = self
                             .remote
@@ -4958,6 +5439,13 @@ impl App {
                                 .as_ref()
                                 .map(|item| item.uri().to_string())
                         });
+                        if crate::telemetry::enabled() {
+                            self.report_remote_snapshot(
+                                seq,
+                                previous_uri.as_deref(),
+                                uri.as_deref(),
+                            );
+                        }
                         self.reconcile_remote_track_intent(seq, uri.as_deref());
                         if let Some(remote) = &self.remote
                             && let Some(device) = &remote.state.device
@@ -4980,12 +5468,35 @@ impl App {
                             self.on_now_playing_changed();
                         }
                     }
-                    Err(error) => log::debug!("playback state unavailable: {error}"),
+                    Err(error) => {
+                        log::debug!("playback state unavailable: {error}");
+                        let record = if counters::POLL_FAILURES.ready(Duration::from_secs(30)) {
+                            crate::telemetry::event("playback.remote_poll_failed")
+                        } else {
+                            crate::telemetry::crumb("playback.remote_poll_failed")
+                        };
+                        record
+                            .field("seq", seq)
+                            .field("error", api_error_kind(&error))
+                            .field("status", error.status())
+                            .field_with("latency_ms", || {
+                                self.diag
+                                    .remote_poll_sent
+                                    .filter(|(sent, _)| *sent == seq)
+                                    .map(|(_, at)| crate::telemetry::duration_ms(at.elapsed()))
+                            })
+                            .text("message", &error.to_string())
+                            .emit();
+                    }
                 }
             }
             ApiResponse::Queue { seq, result } => {
                 if seq != self.queue_seq {
                     // A newer request supersedes this response.
+                    counters::QUEUE_SUPERSEDED.incr();
+                    crate::telemetry::crumb("queue.superseded")
+                        .field("requests_behind", self.queue_seq.saturating_sub(seq))
+                        .emit();
                     return;
                 }
                 // Partial reads and read failures must preserve optimistic
@@ -4999,11 +5510,49 @@ impl App {
                         .as_ref()
                         .is_ok_and(|fetched| self.queue_fetch_is_stale(fetched))
                 {
+                    counters::QUEUE_STALE.incr();
+                    if crate::telemetry::enabled() {
+                        let reason = if writing_queue {
+                            Some("writing")
+                        } else {
+                            result
+                                .as_ref()
+                                .ok()
+                                .and_then(|fetched| self.queue_fetch_stale_reason(fetched))
+                        };
+                        stale_answer("queue")
+                            .field("reason", reason)
+                            .field("retries", self.queue_stale_retries)
+                            .field("seq", seq)
+                            .field_with("intent_age_ms", || {
+                                self.intent_track.as_ref().map(|intent| {
+                                    crate::telemetry::duration_ms(intent.at.elapsed())
+                                })
+                            })
+                            .emit();
+                    }
                     // Keep the optimistic queue and retry after a stale
                     // response. Accept Spotify's state after the retry limit.
                     self.queue_stale_retries = self.queue_stale_retries.saturating_add(1);
                     self.queue_recheck_at = Some(Instant::now() + QUEUE_RECHECK);
                     return;
+                }
+                let retries = self.queue_stale_retries;
+                if retries > 0 || result.is_err() {
+                    let failed = result.is_err();
+                    let ship = !failed || counters::QUEUE_FAILURES.ready(Duration::from_secs(30));
+                    let record = if ship {
+                        crate::telemetry::event("queue.read")
+                    } else {
+                        crate::telemetry::crumb("queue.read")
+                    };
+                    record
+                        .field("seq", seq)
+                        .field("retries", retries)
+                        .field("gave_up", retries >= QUEUE_STALE_RETRIES)
+                        .field("ok", !failed)
+                        .field_with("error", || result.as_ref().err().map(api_error_kind))
+                        .emit();
                 }
                 self.queue_stale_retries = 0;
                 if result.is_ok() {
@@ -5873,6 +6422,9 @@ impl App {
                     self.sync_liked_songs();
                     self.checkpoint_liked_songs(true);
                     self.liked_recheck_at = Some(Instant::now() + Duration::from_secs(5));
+                    crate::telemetry::crumb("app.liked_recheck_scheduled")
+                        .field("rows_loaded", self.library.liked.items.len())
+                        .emit();
                 }
             }
             ApiResponse::Contains { uris, result } => {
@@ -6108,6 +6660,28 @@ impl App {
                         self.track_used.insert(id, Instant::now());
                     }
                     Err(error) => {
+                        // The remembered song is asked for again on the
+                        // next pass after a failure, so its failures are
+                        // recorded at most once per 30 s.
+                        let resume_track = self.resume_track.as_deref().and_then(util::uri_id)
+                            == Some(id.as_str());
+                        let record = if resume_track
+                            && !counters::RESUME_TRACK_FAILURES.ready(Duration::from_secs(30))
+                        {
+                            None
+                        } else if counters::TRACK_FAILURES.ready(Duration::from_secs(30)) {
+                            Some(crate::telemetry::event("api.track_failed"))
+                        } else {
+                            Some(crate::telemetry::crumb("api.track_failed"))
+                        };
+                        if let Some(record) = record {
+                            record
+                                .field("error", api_error_kind(&error))
+                                .field("status", error.status())
+                                .field("resume_track", resume_track)
+                                .field("resume_only", self.resume_only())
+                                .emit();
+                        }
                         self.resolve_pasted_song(&format!("spotify:track:{id}"), None);
                         if self.pending_link.as_deref()
                             == Some(format!("spotify:track:{id}").as_str())
@@ -6139,6 +6713,14 @@ impl App {
                 ),
             },
             ApiResponse::Remote { action, result } => {
+                crate::telemetry::event("playback.remote_result")
+                    .field("action", remote_action_name(action))
+                    .field("ok", result.is_ok())
+                    .field_with("error", || result.as_ref().err().map(api_error_kind))
+                    .field_with("status", || {
+                        result.as_ref().err().and_then(|error| error.status())
+                    })
+                    .emit();
                 if matches!(action, RemoteAction::Play | RemoteAction::Pause) {
                     self.clear_play_pending();
                 }
@@ -6240,6 +6822,7 @@ impl App {
 
     fn poll_remote_soon(&mut self) {
         self.remote_polled_at = Instant::now() - REMOTE_POLL_IDLE + Duration::from_millis(700);
+        self.diag.remote_poll_soon = true;
     }
 
     // ---- navigation ------------------------------------------------------------
@@ -6487,8 +7070,16 @@ impl App {
                 self.locale,
                 "Nothing is playing. Pick something first",
             ));
+            crate::telemetry::event("ui.banner")
+                .field("banner", "no_active_device")
+                .field("action", remote_action_name(action))
+                .field("local_ready", self.local_ready)
+                .field("local_playback", local_playback_label(&self.local_playback))
+                .emit();
+            self.trace_dropped("no_target");
             return;
         }
+        let named_device = device_id.is_some();
         self.backend.api(ApiRequest::Remote {
             action,
             device_id,
@@ -6498,6 +7089,12 @@ impl App {
             flag: false,
             repeat: String::new(),
         });
+        self.trace_applied();
+        crate::telemetry::crumb("playback.remote_command")
+            .field("action", remote_action_name(action))
+            .field("named_device", named_device)
+            .field_with("intent_id", || self.applying_id())
+            .emit();
     }
 
     /// Remembers `uri` as the most recently played context, for the
@@ -6727,6 +7324,7 @@ impl App {
     /// in one ordered exchange: two independent requests race, and shuffle
     /// sometimes lost.
     fn play_request(&mut self, request: PlayRequest, shuffle_first: bool) {
+        self.start_trace("play", 2000);
         // Shuffle applies across contexts until disabled. A selected row still
         // starts first; otherwise choose a random starting track.
         let mut request = request;
@@ -6791,6 +7389,9 @@ impl App {
             at: Instant::now(),
         });
         self.queue_start_pending = Some(self.target());
+        if crate::telemetry::enabled() {
+            self.report_load_request(&request, shuffle, shuffle_first);
+        }
         match self.target() {
             Target::Local if !self.local.connected => {
                 // Hold the request while the local engine reconnects.
@@ -6803,6 +7404,7 @@ impl App {
                 self.local_list = load.context_uri.is_none().then(|| load.uris.clone());
                 let shuffle_after = shuffle && load.shuffle.is_none() && !load.uris.is_empty();
                 self.backend.player(PlayerCommand::Load(load));
+                self.trace_applied_or("play");
                 if shuffle_after {
                     self.backend.player(PlayerCommand::Shuffle(true));
                 }
@@ -6826,6 +7428,7 @@ impl App {
                         repeat: String::new(),
                     });
                 }
+                self.trace_applied_or("play");
                 self.optimistic_playing = Some((true, Instant::now()));
             }
             Target::Remote(None) => {
@@ -6847,6 +7450,15 @@ impl App {
                         self.locale,
                         "Choose a device, or enable playback on this computer",
                     ));
+                    crate::telemetry::event("ui.banner")
+                        .field("banner", "choose_device")
+                        .field("local_playback", local_playback_label(&self.local_playback))
+                        .emit();
+                    if self.diag.applying.is_some() {
+                        self.trace_dropped("no_target");
+                    } else {
+                        crate::telemetry::trace_end("play", "no_target");
+                    }
                     self.show_devices = true;
                     self.refresh_devices();
                 }
@@ -7182,11 +7794,15 @@ impl App {
     }
 
     fn toggle_play(&mut self) {
+        if crate::telemetry::enabled() {
+            self.report_toggle();
+        }
         let playing = self.now_playing().map(|now| now.playing);
         match self.target() {
             Target::Local => {
                 if self.local.is_active() {
                     self.backend.player(PlayerCommand::Toggle);
+                    self.trace_applied();
                 } else if let Some(remote) = self.remote_fresh() {
                     // Nothing is playing locally: resume on this computer.
                     let uri = remote
@@ -7249,10 +7865,14 @@ impl App {
             self.session_dirty = true;
             return;
         }
+        if crate::telemetry::enabled() {
+            self.report_seek(position_ms);
+        }
         match self.target() {
             Target::Local => {
                 self.pending_local_position = Some((position_ms, Instant::now()));
                 self.backend.player(PlayerCommand::Seek(position_ms));
+                self.trace_applied();
             }
             Target::Remote(device_id) => {
                 self.pending_remote_position = Some((position_ms, Instant::now()));
@@ -7265,6 +7885,7 @@ impl App {
                     flag: false,
                     repeat: String::new(),
                 });
+                self.trace_applied();
             }
         }
     }
@@ -7405,6 +8026,10 @@ impl App {
     }
 
     fn transfer(&mut self, device_id: String) {
+        let to_local = Some(device_id.as_str()) == self.local_device_id.as_deref();
+        if crate::telemetry::enabled() {
+            self.report_transfer(to_local);
+        }
         if Some(device_id.as_str()) == self.local_device_id.as_deref() {
             self.selected_device = None;
             self.show_devices = false;
@@ -7421,6 +8046,9 @@ impl App {
                 self.optimistic_playing = None;
                 self.clear_play_pending();
                 self.backend.player(PlayerCommand::Transfer);
+                self.trace_applied();
+            } else {
+                self.trace_dropped("already_here");
             }
             self.poll_remote_soon();
             return;
@@ -7428,6 +8056,7 @@ impl App {
         let play = self.now_playing().is_some_and(|now| now.playing);
         self.selected_device = Some(device_id.clone());
         self.backend.api(ApiRequest::Transfer { device_id, play });
+        self.trace_applied();
     }
 
     /// Adds a row to Next up immediately, before the context's upcoming rows.
@@ -7597,11 +8226,13 @@ impl App {
             .replace("{name}", &label),
         );
         if self.local.is_active() && self.target() == Target::Local {
+            self.report_queue_mutation("album", count, "local");
             for uri in uris {
                 self.backend.player(PlayerCommand::AddToQueue(uri));
             }
             self.queue_recheck_at = Some(Instant::now() + QUEUE_RECHECK);
         } else {
+            self.report_queue_mutation("album", count, "webapi");
             self.write_queue_adds(uris, pending_start);
         }
     }
@@ -7624,6 +8255,12 @@ impl App {
             }
         }
         if count > 0 {
+            let route = if self.local.is_active() && matches!(self.target(), Target::Local) {
+                "local"
+            } else {
+                "webapi"
+            };
+            self.report_queue_mutation("add_many", count, route);
             self.queued_toast(count);
         }
     }
@@ -7645,6 +8282,9 @@ impl App {
     /// current order. librespot can only append to or clear a live queue,
     /// so a move or positional insert clears it and re-adds every song.
     fn resync_local_queue(&mut self) {
+        // One clear and one add per song, each a Connect update a Next
+        // waits behind.
+        self.report_queue_mutation("resync", self.manual_queue.len(), "local");
         self.backend.player(PlayerCommand::ClearQueue);
         for uri in self.manual_queue.clone() {
             if uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:") {
@@ -7676,9 +8316,15 @@ impl App {
         // Other targets and item types use the Web API.
         let track_like = uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:");
         if track_like && self.local.is_active() && matches!(self.target(), Target::Local) {
+            if announce {
+                self.report_queue_mutation("add", 1, "local");
+            }
             self.backend.player(PlayerCommand::AddToQueue(uri));
             self.queue_recheck_at = Some(Instant::now() + QUEUE_RECHECK);
             return;
+        }
+        if announce {
+            self.report_queue_mutation("add", 1, "webapi");
         }
         self.write_queue_adds(vec![uri], pending_start);
     }
@@ -8223,6 +8869,33 @@ impl App {
     }
 
     pub(crate) fn apply(&mut self, action: Action, ctx: &egui::Context) {
+        if !crate::telemetry::enabled() {
+            self.apply_action(action, ctx);
+            return;
+        }
+        let name = action_name(&action);
+        let applying = playback_action_kind(&action).and_then(|kind| self.note_intent(kind));
+        let outer = std::mem::replace(&mut self.diag.applying, applying);
+        let started = Instant::now();
+        self.apply_action(action, ctx);
+        let elapsed = started.elapsed();
+        self.diag.applying = outer;
+        counters::ACTIONS.incr();
+        counters::ACTION_MAX_US.raise(elapsed.as_micros().min(i64::MAX as u128) as i64);
+        if elapsed >= Duration::from_millis(8) {
+            let record = if elapsed >= Duration::from_millis(250) {
+                crate::telemetry::event("app.slow_action")
+            } else {
+                crate::telemetry::crumb("app.slow_action")
+            };
+            record
+                .field("action", name)
+                .ms("duration_ms", elapsed)
+                .emit();
+        }
+    }
+
+    fn apply_action(&mut self, action: Action, ctx: &egui::Context) {
         if matches!(
             &action,
             Action::Open(_)
@@ -8360,29 +9033,39 @@ impl App {
             }
             Action::TogglePlay => self.toggle_play(),
             Action::Next if self.resume_only() => {
-                self.step_resume(true);
+                let moved = self.step_resume(true);
+                self.report_resume_step("playback.next", moved, false);
             }
             Action::Next => {
                 // Move the queue head to the playing row immediately. Do not
                 // pop when there is no active playback target.
                 let target = self.target();
+                let asked = Instant::now();
                 if !matches!(target, Target::Remote(None)) || self.remote_fresh().is_some() {
                     self.pop_queue_head();
                 }
+                if crate::telemetry::enabled() {
+                    self.report_skip("next", &target, asked);
+                }
                 match target {
-                    Target::Local => self.backend.player(PlayerCommand::Next),
+                    Target::Local => {
+                        self.backend.player(PlayerCommand::Next);
+                        self.trace_applied();
+                    }
                     Target::Remote(device_id) => self.remote(RemoteAction::Next, device_id),
                 }
             }
             // Previous restarts after three seconds and otherwise steps back,
             // matching librespot.
             Action::Previous if self.resume_only() => {
-                if self.resume_position_ms > RESTART_BEFORE_PREVIOUS {
+                let restart = self.resume_position_ms > RESTART_BEFORE_PREVIOUS;
+                if restart {
                     self.resume_position_ms = 0;
                     self.session_dirty = true;
                 } else {
                     self.step_resume(false);
                 }
+                self.report_resume_step("playback.previous", true, restart);
             }
             Action::Previous => {
                 // Next names its expected destination so the row moves before
@@ -8391,8 +9074,15 @@ impl App {
                 // the row marker stuck on the skipped-to song.
                 self.intent_track = None;
                 self.queue_start_pending = Some(self.target());
+                if crate::telemetry::enabled() {
+                    let target = self.target();
+                    self.report_skip("previous", &target, Instant::now());
+                }
                 match self.target() {
-                    Target::Local => self.backend.player(PlayerCommand::Previous),
+                    Target::Local => {
+                        self.backend.player(PlayerCommand::Previous);
+                        self.trace_applied();
+                    }
                     Target::Remote(device_id) => self.remote(RemoteAction::Previous, device_id),
                 }
             }
@@ -8784,6 +9474,8 @@ impl App {
                 }
             }
             Action::RefreshDevices => {
+                // Bypasses the freshness window: control clients send it.
+                counters::DEVICES_FORCED.incr();
                 self.devices_fetched_at = None;
                 self.refresh_devices();
                 self.backend.send(Command::DiscoverReceivers);
@@ -9117,6 +9809,12 @@ impl App {
                 ctx.set_theme(self.theme_preference());
             }
             Action::RestartEngine => {
+                // Restarting stops whatever plays here.
+                crate::telemetry::note_cause("app:restart_engine", "settings");
+                crate::telemetry::event("settings.restart_engine")
+                    .field("local_ready", self.local_ready)
+                    .field("playing", self.believed_playing())
+                    .emit();
                 self.save_settings();
                 let config = engine_config(
                     &self.dirs,
@@ -9760,7 +10458,9 @@ impl App {
         listening.recorded = true;
         self.plays
             .record(crate::history::played_track(&now), jiff::Timestamp::now());
+        let started = Instant::now();
         self.plays.save(&self.dirs.history_file());
+        report_save("history", started);
         self.rebuild_recents();
     }
 
@@ -9869,12 +10569,19 @@ impl App {
         if self.settings.winamp_window && needs_sign_in && !self.switch_intent {
             self.actions.push(Action::ToggleWinampWindow);
         }
+        // Untagged playback actions from this frame came from this window.
+        self.diag.untagged_source = if self.settings.winamp_window {
+            "winamp"
+        } else {
+            "ui"
+        };
         if self.settings.winamp_window {
             crate::ui::winamp::show(self, ui);
         } else {
             crate::ui::show(self, ui);
         }
         self.apply_actions(ctx);
+        self.diag.untagged_source = "";
         let autoscroll = self.autoscroll.finish(
             ctx,
             crate::autoscroll::enabled(self.settings.middle_click_autoscroll),
@@ -9948,6 +10655,7 @@ impl App {
             self.resume_position_ms = now.position_ms;
         }
         if !self.offline {
+            let started = Instant::now();
             SessionState {
                 last_page: Some(self.page().encode()),
                 recent_contexts: self.recent_contexts.clone(),
@@ -9987,13 +10695,20 @@ impl App {
                 }),
             }
             .save(&self.dirs.session_file());
+            report_save("session", started);
         }
     }
 
     /// Final teardown at real quit.
     pub fn shutdown(&mut self) {
+        let started = Instant::now();
         self.save_state();
+        let saved = started.elapsed();
         self.backend.shutdown();
+        crate::telemetry::event("app.shutdown")
+            .ms("save_ms", saved)
+            .ms("backend_ms", started.elapsed().saturating_sub(saved))
+            .emit();
     }
 }
 
@@ -10058,10 +10773,21 @@ impl App {
     }
 
     fn refresh_liked_songs(&mut self) {
+        let reason = self.diag.liked_refresh_reason.take().unwrap_or("stale");
         if !self.liked_songs.cache_checked {
             self.ensure_liked_songs();
             return;
         }
+        // Reads every loaded page again, one request per fifty songs.
+        counters::LIKED_REFRESHES.incr();
+        crate::telemetry::event("app.liked_refresh")
+            .field("reason", reason)
+            .field("rows_loaded", self.library.liked.items.len())
+            .field(
+                "confirmed_changes",
+                self.liked_songs.has_confirmed_changes(),
+            )
+            .emit();
         self.load_generation = self.load_generation.wrapping_add(1);
         self.liked_songs.start_refresh(self.load_generation);
         self.library.liked.loading = true;
@@ -10139,6 +10865,1049 @@ impl App {
             self.backend.api(ApiRequest::Track { id: id.to_string() });
         }
         true
+    }
+}
+
+// ---- telemetry ------------------------------------------------------------------
+//
+// Inert unless telemetry is on (see `crate::telemetry`). Intents and traces
+// for playback actions start here; the backend, the player and the sink mark
+// the later steps.
+
+impl App {
+    /// Pushes `action`, naming `source` in the intent it records.
+    pub fn push_action_from(&mut self, action: Action, source: &'static str) {
+        self.push_tagged_action(action, source, None, None);
+    }
+
+    /// Pushes `action` with a telemetry tag: its source, the intent to
+    /// record when that says more than the action (`play` or `pause` for a
+    /// toggle), and why it may repeat the one before it.
+    pub fn push_tagged_action(
+        &mut self,
+        action: Action,
+        source: &'static str,
+        intent: Option<&'static str>,
+        duplicate: Option<&'static str>,
+    ) {
+        if crate::telemetry::enabled()
+            && let Some(kind) = playback_action_kind(&action)
+        {
+            let tags = &mut self.diag.action_tags;
+            // Tags whose action was dropped before it was applied.
+            tags.retain(|tag| tag.at.elapsed() < Duration::from_secs(5));
+            if tags.len() >= 32 {
+                tags.remove(0);
+            }
+            tags.push(ActionTag {
+                kind,
+                intent: intent.unwrap_or(kind),
+                source,
+                at: Instant::now(),
+                duplicate,
+            });
+        }
+        self.actions.push(action);
+    }
+
+    fn take_action_tag(&mut self, kind: &'static str) -> Option<ActionTag> {
+        let index = self
+            .diag
+            .action_tags
+            .iter()
+            .position(|tag| tag.kind == kind && tag.at.elapsed() < Duration::from_secs(5))?;
+        Some(self.diag.action_tags.remove(index))
+    }
+
+    fn untagged_source(&self) -> &'static str {
+        if self.diag.untagged_source.is_empty() {
+            "ui"
+        } else {
+            self.diag.untagged_source
+        }
+    }
+
+    /// Records the intent of the playback action about to be applied, with
+    /// the source its tag names, and flags a toggle that undoes the one
+    /// before it.
+    fn note_intent(&mut self, kind: &'static str) -> Option<AppliedIntent> {
+        let tag = self.take_action_tag(kind);
+        let duplicate = tag.as_ref().and_then(|tag| tag.duplicate);
+        // A held key or a wheel repeats many times a second.
+        if kind == "volume" && !counters::VOLUME_INTENTS.ready(Duration::from_secs(1)) {
+            return None;
+        }
+        if kind != "toggle"
+            && duplicate == Some("key_repeat")
+            && !counters::KEY_REPEATS.ready(Duration::from_secs(1))
+        {
+            return None;
+        }
+        let source = match &tag {
+            Some(tag) => tag.source,
+            None => self.untagged_source(),
+        };
+        let action = tag.as_ref().map_or(kind, |tag| tag.intent);
+        // Looked up before this intent joins the list.
+        let previous = if kind == "toggle" {
+            crate::telemetry::recent_intent(&["toggle", "play", "pause"], Duration::from_secs(1))
+        } else {
+            None
+        };
+        let id = crate::telemetry::intent(action, source);
+        // Only toggles look for a previous intent, so for the rest this is
+        // the tag's own reason.
+        let double = match (duplicate, &previous) {
+            (Some(reason), _) => Some(reason),
+            (None, Some(_)) => Some("rapid"),
+            (None, None) => None,
+        };
+        match double {
+            Some(reason) if kind == "toggle" => {
+                // A held key toggles many times a second: its first double
+                // toggle is the signal, and the rest stay in the recorder.
+                let record = if duplicate != Some("key_repeat")
+                    || counters::KEY_REPEAT_TOGGLES.ready(Duration::from_secs(1))
+                {
+                    crate::telemetry::anomaly("input.double_toggle")
+                } else {
+                    crate::telemetry::crumb("input.double_toggle")
+                };
+                record
+                    .field("reason", reason)
+                    .field("action", action)
+                    .field("source", source)
+                    .field("intent_id", id.as_str())
+                    .field_with("previous_action", || {
+                        previous.as_ref().map(|intent| intent.action)
+                    })
+                    .field_with("previous_source", || {
+                        previous.as_ref().map(|intent| intent.source)
+                    })
+                    .field_with("gap_ms", || {
+                        previous
+                            .as_ref()
+                            .map(|intent| crate::telemetry::duration_ms(intent.at.elapsed()))
+                    })
+                    .field("ui_playing", self.believed_playing())
+                    .field("local_playback", playback_label(self.local.playback))
+                    .emit();
+            }
+            Some(reason) => {
+                crate::telemetry::event("input.repeat")
+                    .field("reason", reason)
+                    .field("action", action)
+                    .field("source", source)
+                    .field("intent_id", id.as_str())
+                    .emit();
+            }
+            None => {}
+        }
+        Some(AppliedIntent {
+            id,
+            source,
+            trace: None,
+        })
+    }
+
+    /// Starts trace `name` for the intent being applied, once per action.
+    fn start_trace(&mut self, name: &'static str, budget_ms: u64) {
+        if let Some(applying) = &mut self.diag.applying
+            && applying.trace.is_none()
+        {
+            applying.trace = Some(name);
+            crate::telemetry::trace_start(name, &applying.id, Duration::from_millis(budget_ms));
+        }
+    }
+
+    /// Marks `action_applied` on this action's trace: it became a backend
+    /// or player command.
+    fn trace_applied(&self) {
+        if let Some(name) = self
+            .diag
+            .applying
+            .as_ref()
+            .and_then(|applying| applying.trace)
+        {
+            crate::telemetry::trace_mark(name, "action_applied");
+        }
+    }
+
+    /// As [`Self::trace_applied`], or, for a held request going out later
+    /// on its own, on the open trace `held`.
+    fn trace_applied_or(&self, held: &'static str) {
+        if self.diag.applying.is_some() {
+            self.trace_applied();
+        } else {
+            crate::telemetry::trace_mark(held, "action_applied");
+        }
+    }
+
+    /// Ends this action's trace when nothing was sent for it.
+    fn trace_dropped(&mut self, outcome: &'static str) {
+        if let Some(name) = self
+            .diag
+            .applying
+            .as_mut()
+            .and_then(|applying| applying.trace.take())
+        {
+            crate::telemetry::trace_end(name, outcome);
+        }
+    }
+
+    fn applying_id(&self) -> Option<String> {
+        self.diag
+            .applying
+            .as_ref()
+            .map(|applying| applying.id.clone())
+    }
+
+    fn applying_source(&self) -> Option<&'static str> {
+        self.diag.applying.as_ref().map(|applying| applying.source)
+    }
+
+    fn local_remaining_ms(&self) -> Option<u32> {
+        let duration = self.local.track.as_ref()?.duration_ms;
+        (duration > 0).then(|| duration.saturating_sub(self.local.position_now()))
+    }
+
+    fn remote_device_is_local(&self) -> Option<bool> {
+        let id = self.remote.as_ref()?.state.device.as_ref()?.id.as_deref()?;
+        Some(Some(id) == self.local_device_id.as_deref())
+    }
+
+    /// Whether a command on `target` should end in sound, which is what
+    /// closes its trace. A paused engine stays silent through a skip.
+    fn will_sound(&self, target: &Target) -> bool {
+        match target {
+            Target::Local => matches!(self.local.playback, Playback::Playing | Playback::Loading),
+            Target::Remote(_) => true,
+        }
+    }
+
+    /// Next or Previous as applied: where it goes, and what predicts how
+    /// long it takes (a preload, the queue, the engine's state).
+    fn report_skip(&mut self, action: &'static str, target: &Target, asked: Instant) {
+        let position = self.local.position_now();
+        let remaining = self.local_remaining_ms();
+        // librespot restarts the song past three seconds: a seek, not a new
+        // track, which the previous-track trace waits for.
+        let restart = action == "previous"
+            && matches!(target, Target::Local)
+            && position >= RESTART_BEFORE_PREVIOUS;
+        let traced = self.will_sound(target) && !restart;
+        if traced {
+            self.start_trace(action, 1500);
+        }
+        let popped = self
+            .intent_track
+            .as_ref()
+            .is_some_and(|intent| intent.at >= asked);
+        let name = if action == "next" {
+            "playback.next"
+        } else {
+            "playback.previous"
+        };
+        // No intent is applying for a key repeat `note_intent` throttled.
+        let record = if self.diag.applying.is_some() {
+            crate::telemetry::event(name)
+        } else {
+            crate::telemetry::crumb(name)
+        };
+        record
+            .field_with("intent_id", || self.applying_id())
+            .field_with("source", || self.applying_source())
+            .field("target", target_label(target))
+            .field("traced", traced)
+            .field("restart", restart)
+            .field("popped", popped)
+            .field("queue_loaded", matches!(self.queue, Loadable::Loaded(_)))
+            .field("queued_rows", self.queued_rows_len())
+            .field("manual_queue", self.manual_queue.len())
+            .field("local_ready", self.local_ready)
+            .field("local_active", self.local.is_active())
+            .field("local_connected", self.local.connected)
+            .field("local_playback", playback_label(self.local.playback))
+            .field("local_loading", self.local.loading)
+            .field("position_ms", position)
+            .field("remaining_ms", remaining)
+            .field("in_preload_window", remaining.map(|ms| ms < 30_000))
+            .field("selected_device", self.selected_device.is_some())
+            .field_with("remote_age_ms", || {
+                self.remote
+                    .as_ref()
+                    .map(|remote| crate::telemetry::duration_ms(remote.received_at.elapsed()))
+            })
+            .field_with("remote_is_local", || self.remote_device_is_local())
+            .emit();
+    }
+
+    /// A skip on the remembered song, before anything plays: no command.
+    fn report_resume_step(&self, name: &'static str, moved: bool, restart: bool) {
+        // No intent is applying for a key repeat `note_intent` throttled.
+        let record = if self.diag.applying.is_some() {
+            crate::telemetry::event(name)
+        } else {
+            crate::telemetry::crumb(name)
+        };
+        record
+            .field_with("intent_id", || self.applying_id())
+            .field_with("source", || self.applying_source())
+            .field("resume_only", true)
+            .field("moved", moved)
+            .field("restart", restart)
+            .emit();
+    }
+
+    /// A chosen Next up row: one skip per row it passes.
+    fn report_queue_row(&mut self, index: usize, skips: usize) {
+        if !crate::telemetry::enabled() {
+            return;
+        }
+        let target = self.target();
+        let traced = self.will_sound(&target);
+        if traced {
+            self.start_trace("next", 1500);
+        }
+        crate::telemetry::event("playback.queue_row")
+            .field_with("intent_id", || self.applying_id())
+            .field_with("source", || self.applying_source())
+            .field("index", index)
+            .field("found", true)
+            .field("skips", skips)
+            .field("target", target_label(&target))
+            .field("traced", traced)
+            .field("local_playback", playback_label(self.local.playback))
+            .emit();
+    }
+
+    /// Which way a toggle is about to go, decided the way `toggle_play`
+    /// decides it, and the trace a resume is timed by.
+    fn report_toggle(&mut self) {
+        let target = self.target();
+        let ui_playing = self.now_playing().map(|now| now.playing);
+        let remote = self
+            .remote_fresh()
+            .map(|remote| (remote.state.is_playing, remote.state.item.is_some()));
+        let resume_last = if self.resume_track.is_some() {
+            "resume_last"
+        } else {
+            "nothing"
+        };
+        let engine_playing = matches!(self.local.playback, Playback::Playing | Playback::Loading);
+        let branch = match &target {
+            Target::Local if self.local.is_active() => {
+                if engine_playing {
+                    "local_pause"
+                } else {
+                    "local_resume"
+                }
+            }
+            Target::Local => match remote {
+                Some((_, true)) => "resume_from_remote",
+                _ => resume_last,
+            },
+            Target::Remote(None) if remote.is_none() => resume_last,
+            Target::Remote(_) if ui_playing == Some(true) => "remote_pause",
+            Target::Remote(_) => "remote_play",
+        };
+        if matches!(branch, "local_resume" | "remote_play") {
+            self.start_trace("resume", 600);
+        }
+        crate::telemetry::event("playback.toggle")
+            .field_with("intent_id", || self.applying_id())
+            .field_with("source", || self.applying_source())
+            .field("branch", branch)
+            .field("target", target_label(&target))
+            .field("ui_playing", ui_playing)
+            .field("engine_playing", engine_playing)
+            .field("belief_matches_engine", ui_playing == Some(engine_playing))
+            .field(
+                "optimistic",
+                self.optimistic_playing
+                    .is_some_and(|(_, at)| at.elapsed() < PLAYBACK_HOLD),
+            )
+            .field("local_playback", playback_label(self.local.playback))
+            .field("local_loading", self.local.loading)
+            .field("local_active", self.local.is_active())
+            .field("remote_fresh", remote.is_some())
+            .field("remote_playing", remote.map(|(playing, _)| playing))
+            .emit();
+    }
+
+    fn report_seek(&mut self, position_ms: u32) {
+        let target = self.target();
+        let traced = self.will_sound(&target);
+        if traced {
+            self.start_trace("seek", 1000);
+        }
+        crate::telemetry::crumb("playback.seek")
+            .field_with("intent_id", || self.applying_id())
+            .field_with("source", || self.applying_source())
+            .field("target", target_label(&target))
+            .field("traced", traced)
+            .field("to_ms", position_ms)
+            .field_with("from_ms", || self.now_playing().map(|now| now.position_ms))
+            .emit();
+    }
+
+    fn report_load_request(&self, request: &PlayRequest, shuffle: bool, shuffle_first: bool) {
+        let target = self.target();
+        crate::telemetry::event("playback.load_request")
+            .field_with("intent_id", || self.applying_id())
+            .field_with("source", || self.applying_source())
+            // A request held for the engine and sent once it was ready.
+            .field("replay", self.diag.applying.is_none())
+            .field("target", target_label(&target))
+            .field(
+                "context",
+                request.context_uri.as_deref().map_or("tracks", uri_class),
+            )
+            .field("uris", request.uris.len())
+            .field(
+                "offset",
+                request.offset_uri.is_some() || request.offset_position.is_some(),
+            )
+            .field("resume_position", request.position_ms > 0)
+            .field("shuffle", shuffle)
+            .field("shuffle_first", shuffle_first)
+            .field(
+                "held",
+                matches!(target, Target::Local) && !self.local.connected,
+            )
+            .field("local_ready", self.local_ready)
+            .field("local_connected", self.local.connected)
+            .field("local_playback", local_playback_label(&self.local_playback))
+            .emit();
+    }
+
+    fn report_transfer(&mut self, to_local: bool) {
+        let playing = self.now_playing().is_some_and(|now| now.playing);
+        // Moving here what is paused elsewhere makes no sound to wait for.
+        let traced = !to_local || (!self.local.is_active() && playing);
+        if traced {
+            self.start_trace("transfer", 4000);
+        }
+        crate::telemetry::event("playback.transfer")
+            .field_with("intent_id", || self.applying_id())
+            .field_with("source", || self.applying_source())
+            .field("to_local", to_local)
+            .field("local_active", self.local.is_active())
+            .field("local_ready", self.local_ready)
+            .field("playing", playing)
+            .field("traced", traced)
+            .emit();
+    }
+
+    /// A change to Next up. A preload taken before it plays the old head,
+    /// and each local add is a Connect update a Next waits behind.
+    fn report_queue_mutation(&self, kind: &'static str, count: usize, route: &'static str) {
+        let remaining = self.local_remaining_ms();
+        crate::telemetry::event("queue.mutation")
+            .field("kind", kind)
+            .field("count", count)
+            .field("route", route)
+            .field("manual_queue", self.manual_queue.len())
+            .field("in_preload_window", remaining.map(|ms| ms < 30_000))
+            .emit();
+    }
+
+    /// A command from the system's media controls: a media key, AirPods,
+    /// Control Centre or the Now Playing widget.
+    fn report_media_command(
+        &mut self,
+        name: &'static str,
+        action: Option<&Action>,
+        playing: bool,
+        (batch, index): (usize, usize),
+        waited_ms: Option<u64>,
+    ) {
+        let mapped = action.map_or("ignored", action_name);
+        let since = self.diag.last_media_command.replace(Instant::now());
+        counters::MEDIA_COMMANDS.incr();
+        crate::telemetry::note_cause(format!("media:{name}"), mapped);
+        crate::telemetry::event("input.media_command")
+            .field("command", name)
+            .field("mapped", mapped)
+            .field("batch_len", batch)
+            .field("batch_index", index)
+            .field("waited_ms", waited_ms)
+            .field("ui_playing", playing)
+            .field("believed_playing", self.believed_playing())
+            .field(
+                "optimistic",
+                self.optimistic_playing
+                    .is_some_and(|(_, at)| at.elapsed() < PLAYBACK_HOLD),
+            )
+            .field("local_playback", playback_label(self.local.playback))
+            .field("local_loading", self.local.loading)
+            .field("target", target_label(&self.target()))
+            .field("window_hidden", self.window_hidden)
+            .field_with("since_previous_ms", || {
+                since.map(|at| crate::telemetry::duration_ms(at.elapsed()))
+            })
+            .emit();
+    }
+
+    /// What Spotify lists, and whether this computer's name appears more
+    /// than once: installs that share a name share a Connect device id.
+    fn report_devices(&self) {
+        let local_id = self.local_device_id.as_deref();
+        let local = self
+            .devices
+            .iter()
+            .find(|device| local_id.is_some() && device.id.as_deref() == local_id);
+        let named_like_local = self
+            .devices
+            .iter()
+            .filter(|device| device.name == self.settings.device_name)
+            .count();
+        crate::telemetry::crumb("connect.device_census")
+            .field("count", self.devices.len())
+            .field("local_listed", local.is_some())
+            .field(
+                "local_is_active",
+                local.is_some_and(|device| device.is_active),
+            )
+            .field(
+                "active_type",
+                self.devices
+                    .iter()
+                    .find(|device| device.is_active)
+                    .map(|device| device.kind.clone()),
+            )
+            .field("named_like_local", named_like_local)
+            .field(
+                "restricted",
+                self.devices
+                    .iter()
+                    .filter(|device| device.is_restricted)
+                    .count(),
+            )
+            .emit();
+        if named_like_local > 1 && counters::NAME_COLLISIONS.ready(Duration::from_secs(600)) {
+            crate::telemetry::event("connect.name_collision")
+                .field("named_like_local", named_like_local)
+                .field("default_name", self.settings.device_name == "Spotifast")
+                .emit();
+        }
+    }
+
+    /// A playback poll as received: how late, what it says against the
+    /// engine, and answers the interface holds its own state over.
+    fn report_remote_snapshot(&mut self, seq: u64, previous_uri: Option<&str>, uri: Option<&str>) {
+        let latency = self
+            .diag
+            .remote_poll_sent
+            .filter(|(sent, _)| *sent == seq)
+            .map(|(_, at)| at.elapsed());
+        let device_is_local = self.remote_device_is_local().unwrap_or(false);
+        let is_playing = self
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.state.is_playing);
+        let device_type = self
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.state.device.as_ref())
+            .map(|device| device.kind.clone());
+        let local_track = self.local.track.as_ref().map(|track| track.uri.as_str());
+        let same_track = uri.is_some() && uri == local_track;
+        let engine_playing = matches!(self.local.playback, Playback::Playing | Playback::Loading);
+        crate::telemetry::crumb("playback.remote_snapshot")
+            .field("seq", seq)
+            .field_with("latency_ms", || latency.map(crate::telemetry::duration_ms))
+            .field("empty", self.remote.is_none())
+            .field("is_playing", is_playing)
+            .field("has_item", uri.is_some())
+            .field("item_changed", uri != previous_uri)
+            .field("device_is_local", device_is_local)
+            .field("device_type", device_type)
+            .field("same_track_as_local", same_track)
+            .field("local_active", self.local.is_active())
+            .field("engine_playing", engine_playing)
+            .emit();
+        if self.remote.is_some()
+            && let Some((wanted, at)) = self.optimistic_playing
+            && at.elapsed() < PLAYBACK_HOLD
+            && wanted != is_playing
+        {
+            stale_answer("remote_playing")
+                .field("seq", seq)
+                .field("wanted", wanted)
+                .ms("hold_age_ms", at.elapsed())
+                .field("device_is_local", device_is_local)
+                .emit();
+        }
+        if let Some(intent) = &self.intent_track
+            && let TrackConfirmation::Remote {
+                after_poll,
+                mismatches,
+            } = intent.confirmation
+            && seq > after_poll
+            && uri != Some(intent.uri.as_str())
+        {
+            // A second contradicting poll settles on Spotify's track.
+            let record = if mismatches > 0 {
+                crate::telemetry::event("ui.optimistic_overruled").field("what", "remote_track")
+            } else {
+                stale_answer("remote_track")
+            };
+            record
+                .field("seq", seq)
+                .ms("intent_age_ms", intent.at.elapsed())
+                .emit();
+        }
+        // Spotify says this device plays while its engine does not: another
+        // install shares the device id, or Connect lost track of it.
+        let ghost = device_is_local && is_playing && !engine_playing && !self.local.loading;
+        self.diag.ghost_polls = if ghost {
+            self.diag.ghost_polls.saturating_add(1)
+        } else {
+            0
+        };
+        if self.diag.ghost_polls == 3 {
+            crate::telemetry::anomaly("connect.ghost_self")
+                .field("same_track_as_local", same_track)
+                .field("local_playback", playback_label(self.local.playback))
+                .field("local_connected", self.local.connected)
+                .field("local_ready", self.local_ready)
+                .field("polls", 3)
+                .emit();
+        }
+    }
+
+    /// Engine reports that overrule or are ignored against what the
+    /// interface showed.
+    fn report_local_change(&self, state: &LocalState, track_changed: bool) {
+        if state.shuffle != self.local.shuffle
+            && let Some(at) = self.shuffle_set_at
+            && at.elapsed() <= Duration::from_secs(5)
+        {
+            stale_answer("engine_shuffle")
+                .field("shuffle", state.shuffle)
+                .ms("since_set_ms", at.elapsed())
+                .emit();
+        }
+        // The first engine state after an action replaces the optimistic one.
+        if state.playback != self.local.playback
+            && let Some((wanted, at)) = self.optimistic_playing
+            && at.elapsed() < PLAYBACK_HOLD
+            && wanted != matches!(state.playback, Playback::Playing | Playback::Loading)
+        {
+            crate::telemetry::event("ui.optimistic_overruled")
+                .field("what", "playing")
+                .field("wanted", wanted)
+                .field("engine", playback_label(state.playback))
+                .field("previous", playback_label(self.local.playback))
+                .ms("hold_age_ms", at.elapsed())
+                .emit();
+        }
+        if track_changed
+            && let Some(intent) = &self.intent_track
+            && matches!(intent.confirmation, TrackConfirmation::Local)
+            && state.track.as_ref().map(|track| track.uri.as_str()) != Some(intent.uri.as_str())
+        {
+            crate::telemetry::event("ui.optimistic_overruled")
+                .field("what", "local_track")
+                .field("track_sequence", state.track_sequence)
+                .ms("intent_age_ms", intent.at.elapsed())
+                .emit();
+        }
+    }
+
+    /// Optimistic state never confirmed: when its hold runs out the
+    /// interface goes back to what it showed before, which is seen.
+    fn report_expired_holds(&mut self) {
+        if let Some(intent) = &self.intent_track
+            && intent.at.elapsed() >= PLAYBACK_HOLD
+            && self.queued_play.is_none()
+            && self.diag.reported_track_hold != Some(intent.at)
+        {
+            let at = intent.at;
+            crate::telemetry::event("ui.hold_expired")
+                .field("what", "track")
+                .field(
+                    "confirmation",
+                    match intent.confirmation {
+                        TrackConfirmation::Local => "local",
+                        TrackConfirmation::Remote { .. } => "remote",
+                    },
+                )
+                .field("local_playback", playback_label(self.local.playback))
+                .field("local_loading", self.local.loading)
+                .field_with("action", || {
+                    crate::telemetry::recent_intent(
+                        &["next", "previous", "play_item"],
+                        Duration::from_secs(15),
+                    )
+                    .map(|intent| intent.action)
+                })
+                .emit();
+            self.diag.reported_track_hold = Some(at);
+        }
+        if let Some((wanted, at)) = self.optimistic_playing
+            && at.elapsed() >= PLAYBACK_HOLD
+            && self.diag.reported_play_hold != Some(at)
+        {
+            crate::telemetry::event("ui.hold_expired")
+                .field("what", "playing")
+                .field("wanted", wanted)
+                .field("shown", self.now_playing().is_some_and(|now| now.playing))
+                .field("local_playback", playback_label(self.local.playback))
+                .field("target", target_label(&self.target()))
+                .emit();
+            self.diag.reported_play_hold = Some(at);
+        }
+    }
+
+    /// Non-personal settings, sent at start and whenever they change.
+    fn report_settings(&mut self) {
+        if !crate::telemetry::enabled() {
+            return;
+        }
+        let snapshot = self.settings_snapshot();
+        if self.diag.settings_reported.as_ref() == Some(&snapshot) {
+            return;
+        }
+        let personal = self
+            .settings
+            .web_client_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty());
+        // `personal_app` is the gateway's: whether the grant is ready.
+        crate::telemetry::set_context("personal_app_configured", personal);
+        crate::telemetry::event("settings.snapshot")
+            .field("changed", self.diag.settings_reported.is_some())
+            .field("settings", snapshot.clone())
+            .emit();
+        self.diag.settings_reported = Some(snapshot);
+    }
+
+    /// Names, ids and addresses stay out: the device and output names go
+    /// in as digests and a guessed kind.
+    fn settings_snapshot(&self) -> serde_json::Value {
+        let settings = &self.settings;
+        serde_json::json!({
+            "personal_app": settings
+                .web_client_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty()),
+            "bitrate": settings.bitrate,
+            "normalisation": settings.normalisation,
+            "gapless": settings.gapless,
+            "autoplay": settings.autoplay,
+            "audio_backend": settings.audio_backend.as_deref().unwrap_or("default"),
+            "output": settings.audio_device.as_deref().map_or("default", output_class),
+            "output_digest": settings.audio_device.as_deref().map(crate::telemetry::digest),
+            "buffer_ms": settings.audio_buffer_ms,
+            "audio_cache": settings.audio_cache,
+            "audio_cache_mb": settings.audio_cache_mb,
+            "eq_on": settings.eq_on,
+            "mono": settings.mono,
+            "proxy_saved": proxy_mode_name(settings.proxy_mode),
+            "proxy_applied": proxy_kind(&self.applied_proxy),
+            "keep_playing_in_background": settings.keep_playing_in_background,
+            "mac_notch_widget": settings.mac_notch_widget,
+            "check_for_updates": settings.check_for_updates,
+            "download_updates_automatically": settings.download_updates_automatically,
+            "winamp_window": settings.winamp_window,
+            "milkdrop_open": settings.milkdrop_open,
+            "accent_from_art": settings.accent_from_art,
+            "playback_authorized": settings.playback_authorized,
+            "device_name_default": settings.device_name == "Spotifast",
+            "device_name_digest": crate::telemetry::digest(&settings.device_name),
+        })
+    }
+
+    /// The tray's timer drives every pass without a window; App Nap can
+    /// stretch it, which delays media keys and polls alike.
+    fn note_headless_tick(&mut self) {
+        if !crate::telemetry::enabled() {
+            return;
+        }
+        counters::HEADLESS_TICKS.incr();
+        let now = Instant::now();
+        if let Some(last) = self.diag.last_headless.replace(now) {
+            let gap = now.duration_since(last);
+            counters::HEADLESS_GAP_MAX_MS.raise(gap.as_millis().min(i64::MAX as u128) as i64);
+            if gap >= Duration::from_secs(1)
+                && counters::HEADLESS_LATE.ready(Duration::from_secs(10))
+            {
+                crate::telemetry::crumb("app.headless_tick_late")
+                    .ms("gap_ms", gap)
+                    .field("playing", self.believed_playing())
+                    .emit();
+            }
+        }
+    }
+}
+
+/// An answer that tells the story from before the user's action, which the
+/// interface holds its own state over or ignores.
+fn stale_answer(what: &'static str) -> crate::telemetry::Event {
+    counters::STALE_ANSWERS.incr();
+    crate::telemetry::event("ui.stale_answer").field("what", what)
+}
+
+/// A state file written on the interface thread.
+fn report_save(file: &'static str, started: Instant) {
+    let elapsed = started.elapsed();
+    let record = if elapsed >= Duration::from_millis(50) {
+        crate::telemetry::event("app.save")
+    } else {
+        crate::telemetry::crumb("app.save")
+    };
+    record.field("file", file).ms("duration_ms", elapsed).emit();
+}
+
+/// The intent a playback action records, or `None` for other actions.
+fn playback_action_kind(action: &Action) -> Option<&'static str> {
+    Some(match action {
+        Action::TogglePlay => "toggle",
+        Action::Next => "next",
+        Action::Previous => "previous",
+        Action::Seek(_) | Action::SeekBy(_) => "seek",
+        Action::PlayContext { .. }
+        | Action::PlayEpisode { .. }
+        | Action::PlayUris { .. }
+        | Action::PlayFromRow { .. }
+        | Action::ShufflePlay(_) => "play_item",
+        Action::Transfer(_) => "transfer",
+        Action::ToggleShuffle | Action::SetShuffle(_) => "shuffle",
+        Action::CycleRepeat | Action::SetRepeat(_) => "repeat",
+        Action::AddToQueue { .. } | Action::QueueMany { .. } | Action::InsertInQueue { .. } => {
+            "queue_add"
+        }
+        Action::SetVolume(_) | Action::VolumeBy(_) | Action::ToggleMute => "volume",
+        _ => return None,
+    })
+}
+
+/// A name for an action that carries none of its contents.
+fn action_name(action: &Action) -> &'static str {
+    if let Some(kind) = playback_action_kind(action) {
+        return kind;
+    }
+    match action {
+        Action::Open(_) => "open",
+        Action::OpenLink(_) => "open_link",
+        Action::Search(_) => "search",
+        Action::LoadMore(_) | Action::LoadWindow { .. } | Action::RetryWindow(_) => "load_more",
+        Action::Reload(_) => "reload",
+        Action::ToggleSaved(_) | Action::SetSavedMany { .. } => "save",
+        Action::AddToPlaylist { .. }
+        | Action::InsertInPlaylist { .. }
+        | Action::ConfirmAddToPlaylist { .. }
+        | Action::PasteSongs { .. } => "playlist_add",
+        Action::RemoveFromPlaylist { .. } | Action::MoveInPlaylist { .. } => "playlist_edit",
+        Action::MoveInQueue { .. } | Action::ClearQueue => "queue_edit",
+        Action::RefreshQueue => "refresh_queue",
+        Action::RefreshDevices => "refresh_devices",
+        Action::RestartEngine => "restart_engine",
+        Action::ApplyProxy => "apply_proxy",
+        Action::SettingsChanged => "settings_changed",
+        Action::ShowWindow | Action::HideWindow | Action::CloseWindow => "window",
+        Action::ToggleWinampWindow => "winamp_window",
+        Action::ClearArtCache => "clear_art_cache",
+        Action::SetTheme(_) | Action::SetCustomTheme(_) | Action::ReloadThemes => "theme",
+        Action::InstallSkin(_) | Action::SetSkin(_) => "skin",
+        Action::Quit => "quit",
+        _ => "other",
+    }
+}
+
+fn target_label(target: &Target) -> &'static str {
+    match target {
+        Target::Local => "local",
+        Target::Remote(Some(_)) => "remote",
+        Target::Remote(None) => "remote_none",
+    }
+}
+
+fn playback_label(playback: Playback) -> &'static str {
+    match playback {
+        Playback::Stopped => "stopped",
+        Playback::Loading => "loading",
+        Playback::Playing => "playing",
+        Playback::Paused => "paused",
+    }
+}
+
+fn local_playback_label(status: &LocalPlayback) -> &'static str {
+    match status {
+        LocalPlayback::Unavailable => "unavailable",
+        LocalPlayback::Authorizing => "authorizing",
+        LocalPlayback::Connecting => "connecting",
+        LocalPlayback::Ready { .. } => "ready",
+        LocalPlayback::Failed(_) => "failed",
+    }
+}
+
+fn auth_label(status: &AuthStatus) -> &'static str {
+    match status {
+        AuthStatus::Starting => "starting",
+        AuthStatus::SignedOut => "signed_out",
+        AuthStatus::WaitingForBrowser { .. } => "waiting_for_browser",
+        AuthStatus::Connecting => "connecting",
+        AuthStatus::Connected { .. } => "connected",
+        AuthStatus::Failed(_) => "failed",
+    }
+}
+
+fn api_error_kind(error: &crate::api::ApiError) -> &'static str {
+    use crate::api::ApiError;
+    match error {
+        ApiError::NotSignedIn => "not_signed_in",
+        ApiError::Status { .. } => "status",
+        ApiError::RateLimited => "rate_limited",
+        ApiError::QuotaExhausted => "quota_exhausted",
+        ApiError::SignInExpired { .. } => "sign_in_expired",
+        ApiError::Network(_) => "network",
+        ApiError::Decode(_) => "decode",
+    }
+}
+
+fn media_command_name(command: &MediaCommand) -> &'static str {
+    match command {
+        MediaCommand::Play => "play",
+        MediaCommand::Pause => "pause",
+        MediaCommand::PlayPause => "play_pause",
+        MediaCommand::Stop => "stop",
+        MediaCommand::Next => "next",
+        MediaCommand::Previous => "previous",
+        MediaCommand::SeekBy(_) => "seek_by",
+        MediaCommand::SetPosition { .. } => "set_position",
+        MediaCommand::SetVolume(_) => "set_volume",
+        MediaCommand::SetShuffle(_) => "set_shuffle",
+        MediaCommand::SetRepeat(_) => "set_repeat",
+        MediaCommand::OpenUri(_) => "open_uri",
+        MediaCommand::Raise => "raise",
+        MediaCommand::Quit => "quit",
+    }
+}
+
+fn control_command_name(command: &ControlCommand) -> &'static str {
+    match command {
+        ControlCommand::Show => "show",
+        ControlCommand::ReloadThemes => "reload_themes",
+        ControlCommand::PlayPause => "play_pause",
+        ControlCommand::Play => "play",
+        ControlCommand::Pause => "pause",
+        ControlCommand::Next => "next",
+        ControlCommand::Previous => "previous",
+        ControlCommand::SeekBy(_) => "seek_by",
+        ControlCommand::VolumeBy(_) => "volume_by",
+        ControlCommand::SetVolume(_) => "set_volume",
+        ControlCommand::ToggleMute => "toggle_mute",
+        ControlCommand::ToggleShuffle => "toggle_shuffle",
+        ControlCommand::CycleRepeat => "cycle_repeat",
+        ControlCommand::SetShuffle(_) => "set_shuffle",
+        ControlCommand::SetRepeat(_) => "set_repeat",
+        ControlCommand::SeekTo(_) => "seek_to",
+        ControlCommand::ToggleSaved => "toggle_saved",
+        ControlCommand::PlayUri(_) => "play_uri",
+        ControlCommand::OpenLink(_) => "open_link",
+        ControlCommand::Transfer(_) => "transfer",
+        ControlCommand::RefreshDevices => "refresh_devices",
+    }
+}
+
+/// What an absolute Play or Pause, sent on as a toggle, asked for.
+fn toggle_intent(command: &str) -> Option<&'static str> {
+    match command {
+        "play" => Some("play"),
+        "pause" | "stop" => Some("pause"),
+        _ => None,
+    }
+}
+
+fn remote_action_name(action: RemoteAction) -> &'static str {
+    match action {
+        RemoteAction::Play => "play",
+        RemoteAction::Pause => "pause",
+        RemoteAction::Next => "next",
+        RemoteAction::Previous => "previous",
+        RemoteAction::Seek => "seek",
+        RemoteAction::Volume => "volume",
+        RemoteAction::Shuffle => "shuffle",
+        RemoteAction::Repeat => "repeat",
+    }
+}
+
+fn proxy_kind(proxy: &crate::settings::ProxyConfig) -> &'static str {
+    use crate::settings::ProxyConfig;
+    match proxy {
+        ProxyConfig::Invalid(_) => "invalid",
+        ProxyConfig::Off => "off",
+        ProxyConfig::System => "system",
+        ProxyConfig::Http(_) => "http",
+        ProxyConfig::Socks(_) => "socks",
+    }
+}
+
+fn proxy_mode_name(mode: crate::settings::ProxyMode) -> &'static str {
+    use crate::settings::ProxyMode;
+    match mode {
+        ProxyMode::Off => "off",
+        ProxyMode::System => "system",
+        ProxyMode::Http => "http",
+        ProxyMode::Socks => "socks",
+    }
+}
+
+/// The kind of a Spotify URI, without its id: a collection URI names the
+/// account.
+fn uri_class(uri: &str) -> &'static str {
+    if uri.ends_with(":collection") {
+        return "collection";
+    }
+    match util::uri_kind(uri) {
+        Some("track") => "track",
+        Some("album") => "album",
+        Some("playlist") => "playlist",
+        Some("artist") => "artist",
+        Some("episode") => "episode",
+        Some("show") => "show",
+        Some("station") => "station",
+        Some(_) => "other",
+        None => "unknown",
+    }
+}
+
+/// A guess at what kind of output a device name is, without the name.
+fn output_class(name: &str) -> &'static str {
+    fn has(name: &str, words: &[&str]) -> bool {
+        words.iter().any(|word| name.contains(*word))
+    }
+    let name = name.to_lowercase();
+    if has(&name, &["airplay"]) {
+        "airplay"
+    } else if has(&name, &["airpods", "beats", "bluetooth", "buds", "headset"]) {
+        "bluetooth"
+    } else if has(&name, &["hdmi", "displayport"]) {
+        "hdmi"
+    } else if has(&name, &["usb"]) {
+        "usb"
+    } else if has(
+        &name,
+        &[
+            "blackhole",
+            "loopback",
+            "soundflower",
+            "virtual",
+            "aggregate",
+            "multi-output",
+        ],
+    ) {
+        "virtual"
+    } else if has(
+        &name,
+        &["macbook", "built-in", "internal", "speakers", "headphones"],
+    ) {
+        "builtin"
+    } else {
+        "unknown"
     }
 }
 
@@ -23094,5 +24863,37 @@ mod tests {
             app.library.liked.revision, before,
             "the shorter list must invalidate the table's cached row order"
         );
+    }
+
+    #[test]
+    fn telemetry_names_leave_out_accounts_and_device_names() {
+        assert_eq!(uri_class("spotify:user:someone:collection"), "collection");
+        assert_eq!(
+            uri_class("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"),
+            "playlist"
+        );
+        assert_eq!(output_class("Kim's AirPods Pro"), "bluetooth");
+        assert_eq!(output_class("MacBook Pro Speakers"), "builtin");
+        assert_eq!(output_class("BlackHole 2ch"), "virtual");
+        assert_eq!(action_name(&Action::Open(Page::Home)), "open");
+        assert_eq!(playback_action_kind(&Action::SeekBy(-10_000)), Some("seek"));
+        assert_eq!(playback_action_kind(&Action::ToggleSidebar), None);
+    }
+
+    #[test]
+    fn tagged_actions_are_pushed_unchanged() {
+        let mut app = headless_app();
+        app.actions.clear();
+        app.push_tagged_action(
+            Action::TogglePlay,
+            "media_key",
+            Some("pause"),
+            Some("media_batch"),
+        );
+        app.push_action_from(Action::Next, "tray");
+        assert!(matches!(
+            app.actions.as_slice(),
+            [Action::TogglePlay, Action::Next]
+        ));
     }
 }
