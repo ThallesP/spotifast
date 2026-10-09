@@ -3637,8 +3637,11 @@ impl App {
             std::mem::take(&mut *queue.lock().unwrap_or_else(|p| p.into_inner()));
         let batch = commands.len();
         let mut toggles = 0;
+        // Actions are applied after the batch, so each command is decided
+        // against what the ones before it will have done: two Pauses in one
+        // batch must not pause and resume.
+        let mut playing = self.now_playing().is_some_and(|now| now.playing);
         for command in commands {
-            let playing = self.now_playing().is_some_and(|now| now.playing);
             let name = control_command_name(&command);
             let action = match command {
                 ControlCommand::Show => Some(Action::ShowWindow),
@@ -3687,6 +3690,7 @@ impl App {
                 .field("ui_playing", playing)
                 .emit();
             if let Some(action) = action {
+                playing = playing_after(&action, playing);
                 // Play and Pause become a toggle decided by what the
                 // interface believed when the batch arrived.
                 let toggle = matches!(action, Action::TogglePlay);
@@ -3712,8 +3716,10 @@ impl App {
         } else {
             None
         };
+        // As for control commands: each command is decided against what the
+        // ones before it in the batch will have done.
+        let mut playing = self.now_playing().is_some_and(|now| now.playing);
         for (index, command) in commands.into_iter().enumerate() {
-            let playing = self.now_playing().is_some_and(|now| now.playing);
             let name = media_command_name(&command);
             let action = match command {
                 MediaCommand::Play => (!playing).then_some(Action::TogglePlay),
@@ -3760,8 +3766,8 @@ impl App {
                 );
             }
             if let Some(action) = action {
-                // Two pause-like commands in one batch both see the same
-                // `playing` and both toggle.
+                playing = playing_after(&action, playing);
+                // Two PlayPause commands in one batch are two presses.
                 let toggle = matches!(action, Action::TogglePlay);
                 let duplicate = (toggle && toggles > 0).then_some("media_batch");
                 toggles += usize::from(toggle);
@@ -11784,6 +11790,16 @@ fn media_command_name(command: &MediaCommand) -> &'static str {
         MediaCommand::OpenUri(_) => "open_uri",
         MediaCommand::Raise => "raise",
         MediaCommand::Quit => "quit",
+    }
+}
+
+/// Whether playback will be playing once `action` is applied, from whether
+/// it was before.
+fn playing_after(action: &Action, playing: bool) -> bool {
+    match action {
+        Action::TogglePlay => !playing,
+        Action::PlayContext { .. } => true,
+        _ => playing,
     }
 }
 
@@ -23899,6 +23915,66 @@ mod tests {
             app.actions
         );
         assert!(queue.lock().expect("the queue").is_empty());
+    }
+
+    /// Two Pauses in one batch (an earbud taken out while Now Playing also
+    /// asks) used to pause and then resume, because both were decided
+    /// against the state from before the batch.
+    #[test]
+    fn repeated_pauses_in_one_batch_pause_once() {
+        // #given
+        let mut app = headless_app();
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: "spotify:track:a".into(),
+            title: "A".into(),
+            ..Default::default()
+        });
+        app.local.playback = Playback::Playing;
+        app.refresh_frame_now();
+        let queue: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
+        app.control_commands = Some(std::sync::Arc::clone(&queue));
+
+        // #when the same Pause arrives twice
+        queue
+            .lock()
+            .expect("the queue")
+            .extend([ControlCommand::Pause, ControlCommand::Pause]);
+        app.handle_control_commands();
+
+        // #then playback is paused once, not paused and resumed
+        assert!(
+            matches!(app.actions.as_slice(), [Action::TogglePlay]),
+            "{:?}",
+            app.actions
+        );
+
+        // #when a Pause and a Play arrive together
+        app.actions.clear();
+        queue
+            .lock()
+            .expect("the queue")
+            .extend([ControlCommand::Pause, ControlCommand::Play]);
+        app.handle_control_commands();
+
+        // #then neither is lost
+        assert!(
+            matches!(
+                app.actions.as_slice(),
+                [Action::TogglePlay, Action::TogglePlay]
+            ),
+            "{:?}",
+            app.actions
+        );
+        assert!(playing_after(
+            &Action::PlayContext {
+                uri: "spotify:album:x".into(),
+                offset_uri: None,
+                offset_index: None,
+            },
+            false
+        ));
+        assert!(!playing_after(&Action::TogglePlay, true));
+        assert!(playing_after(&Action::Next, true));
     }
 
     /// Control clients can set state, seek, play a URI, and transfer playback.
