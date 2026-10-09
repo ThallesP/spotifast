@@ -47,6 +47,11 @@ filter history and the limiter's eight milliseconds of held audio. This keeps
 a fragment of the previous song out of a replacement's silent intro. Natural
 track transitions and pause/resume retain that history.
 
+A skip silences the current song until the replacement is loaded. If Spotify
+Connect never starts that load within ten seconds, because it dropped the
+command, the current song is heard again instead of staying silent until it
+ends.
+
 Since 0.8.0, requests that need a grant still being
 verified wait for it instead of showing "not signed in". Sign-out cancels
 pending requests, and their late results cannot undo a new sign-in. If Spotify

@@ -49,6 +49,10 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Length of each side of an interrupted-track fade.
 const INTERRUPT_FADE: Duration = Duration::from_millis(50);
+/// How long a closed gate waits for librespot to start the load it was
+/// closed for. Spotify Connect can take seconds over a slow network before
+/// it gets to a command; past this it dropped the command.
+const IGNORED_COMMAND: Duration = Duration::from_secs(10);
 
 /// How long Play takes to come up, and Pause and Stop to go down.
 const TRANSPORT_FADE: Duration = Duration::from_millis(50);
@@ -78,6 +82,10 @@ pub const BUFFER_MS_RANGE: std::ops::RangeInclusive<u32> = 20..=500;
 pub struct AudioControl {
     target: Mutex<AudioTarget>,
     waiting_for_track: AtomicBool,
+    /// When the gate last closed for a command, and whether librespot has
+    /// started a load since.
+    gate_closed_at: Mutex<Option<Instant>>,
+    load_started: AtomicBool,
     reset_output: AtomicBool,
     reset_processing: AtomicBool,
     buffer_ms: u32,
@@ -96,6 +104,8 @@ impl AudioControl {
         Arc::new(Self {
             target: Mutex::new(AudioTarget::default()),
             waiting_for_track: AtomicBool::new(false),
+            gate_closed_at: Mutex::new(None),
+            load_started: AtomicBool::new(false),
             reset_output: AtomicBool::new(false),
             reset_processing: AtomicBool::new(false),
             buffer_ms: buffer_ms.clamp(*BUFFER_MS_RANGE.start(), *BUFFER_MS_RANGE.end()),
@@ -126,6 +136,9 @@ impl AudioControl {
             }
             PlayerEvent::Stopped { .. } => self.release("stopped"),
             PlayerEvent::Loading { .. } => metrics::loading(),
+            PlayerEvent::PlayRequestIdChanged { .. } => {
+                self.load_started.store(true, Ordering::SeqCst);
+            }
             _ => {}
         }
     }
@@ -133,6 +146,11 @@ impl AudioControl {
     /// Fades and discards the current output before a user-requested track
     /// change. Repeated skips share the same handoff.
     pub fn interrupt(&self) {
+        self.load_started.store(false, Ordering::SeqCst);
+        *self
+            .gate_closed_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
         if self.waiting_for_track.swap(true, Ordering::SeqCst) {
             metrics::interrupt_repeated();
             return;
@@ -167,6 +185,26 @@ impl AudioControl {
     /// Opens the write gate once librespot has left the old decoder behind.
     pub fn track_changed(&self) {
         self.release("track_changed");
+    }
+
+    /// Opens the gate when the command that closed it was never taken up.
+    /// Spotify Connect drops a skip it cannot carry out (no next song, or a
+    /// moment without its connection), and every load it does start begins
+    /// with a new play request. Without this the old song would keep
+    /// decoding into the closed gate, silent, until it ended.
+    fn release_if_ignored(&self, now: Instant) -> bool {
+        if self.load_started.load(Ordering::SeqCst) {
+            return false;
+        }
+        let closed_at = *self
+            .gate_closed_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if closed_at.is_some_and(|at| now.saturating_duration_since(at) >= IGNORED_COMMAND) {
+            self.release("ignored");
+            return true;
+        }
+        false
     }
 
     /// Releases the gate if the requested replacement stopped instead.
@@ -795,7 +833,7 @@ impl Sink for RodioSink {
         let samples = packet
             .samples()
             .map_err(|error| SinkError::OnWrite(error.to_string()))?;
-        if self.control.waiting_for_track() {
+        if self.control.waiting_for_track() && !self.control.release_if_ignored(Instant::now()) {
             metrics::phase(metrics::GATE);
             // Muting must not remove decoder backpressure. Otherwise cached
             // audio races to EndOfTrack while Connect is still handling the
@@ -2895,6 +2933,30 @@ mod tests {
             assert!(output.by_ref().take(100).all(|sample| sample == 1.0));
             assert!(!control.take_reset());
         }
+    }
+
+    #[test]
+    fn a_skip_spotify_connect_never_takes_up_does_not_mute_the_song() {
+        let control = AudioControl::new(DEFAULT_BUFFER_MS);
+        control.interrupt();
+        let closed = Instant::now();
+        assert!(!control.release_if_ignored(closed + IGNORED_COMMAND / 2));
+        assert!(
+            control.waiting_for_track(),
+            "a slow Connect still gets time"
+        );
+        assert!(control.release_if_ignored(closed + IGNORED_COMMAND));
+        assert!(!control.waiting_for_track(), "the old song is heard again");
+
+        // A load that started keeps the gate closed however long it takes.
+        control.interrupt();
+        control.handle_player_event(&PlayerEvent::PlayRequestIdChanged { play_request_id: 2 });
+        assert!(!control.release_if_ignored(Instant::now() + IGNORED_COMMAND * 3));
+        assert!(control.waiting_for_track());
+
+        // Another skip waits for its own load.
+        control.interrupt();
+        assert!(control.release_if_ignored(Instant::now() + IGNORED_COMMAND));
     }
 
     #[test]
