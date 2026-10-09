@@ -174,6 +174,38 @@ impl Config {
         serde_json::from_str::<Self>(text).ok()
     }
 
+    /// Why a `telemetry.json` that exists was not used, for the log. Never
+    /// quotes the file: it holds the token.
+    pub fn file_problem(config_dir: &Path) -> Option<String> {
+        let text = std::fs::read_to_string(config_dir.join(CONFIG_FILE)).ok()?;
+        let config = match serde_json::from_str::<Self>(&text) {
+            Ok(config) => config,
+            Err(error) => {
+                let kind = match error.classify() {
+                    serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
+                        "is not valid JSON (check for curly quotes)"
+                    }
+                    _ => "needs a text \"axiom_token\"",
+                };
+                return Some(format!(
+                    "{CONFIG_FILE} {kind} at line {}, column {}",
+                    error.line(),
+                    error.column()
+                ));
+            }
+        };
+        if config.valid() {
+            return None;
+        }
+        Some(if config.axiom_token.trim().is_empty() {
+            format!("{CONFIG_FILE} has an empty axiom_token")
+        } else if !config.endpoint.starts_with("https://") {
+            format!("{CONFIG_FILE} needs an https:// endpoint")
+        } else {
+            format!("{CONFIG_FILE} has an invalid token or dataset name")
+        })
+    }
+
     fn valid(&self) -> bool {
         let token = self.axiom_token.trim();
         !token.is_empty()
@@ -2381,6 +2413,34 @@ mod tests {
         };
         assert!(!plain_http.valid());
         assert!(!format!("{config:?}").contains("xaat-1"));
+    }
+
+    #[test]
+    fn a_broken_config_file_is_explained_without_quoting_it() {
+        let directory = std::env::temp_dir().join(format!("spotifast-config-{}", random_id(6)));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        for (text, expect) in [
+            (
+                "{ \u{201c}axiom_token\u{201d}: \u{201c}xaat-secret\u{201d} }",
+                "not valid JSON",
+            ),
+            (r#"{ "axiom_token": 12 }"#, "needs a text"),
+            (r#"{ "axiom_token": " " }"#, "empty axiom_token"),
+            (
+                r#"{ "axiom_token": "xaat-secret", "endpoint": "http://x" }"#,
+                "https://",
+            ),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let problem = Config::file_problem(&directory).expect(text);
+            assert!(problem.contains(expect), "{problem}");
+            assert!(!problem.contains("secret"), "{problem}");
+        }
+        std::fs::write(&path, r#"{ "axiom_token": "xaat-secret" }"#).unwrap();
+        assert_eq!(Config::file_problem(&directory), None);
+        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(Config::file_problem(Path::new("/nonexistent")), None);
     }
 
     #[test]

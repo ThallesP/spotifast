@@ -456,6 +456,11 @@ pub(crate) fn run() -> eframe::Result<()> {
         log::warn!("unable to create the application directories: {error}");
     }
     let mut settings = settings::Settings::load(&dirs.settings_file());
+    if telemetry.is_none()
+        && let Some(problem) = spotifast::telemetry::Config::file_problem(&dirs.config)
+    {
+        log::warn!("telemetry is off: {problem}");
+    }
     if telemetry.is_some() {
         // As App::new resolves it: an invalid proxy holds uploads too.
         let proxy = settings
