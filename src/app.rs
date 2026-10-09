@@ -59,6 +59,10 @@ const REMOTE_RECHECK: Duration = Duration::from_millis(1200);
 const QUEUE_RECHECK: Duration = Duration::from_millis(700);
 /// Number of stale queue responses accepted before trusting Spotify's state.
 const QUEUE_STALE_RETRIES: u8 = 6;
+/// First wait before asking again about a remembered song Spotify could not
+/// describe; it doubles up to the maximum.
+const RESUME_TRACK_RETRY: Duration = Duration::from_secs(30);
+const RESUME_TRACK_RETRY_MAX: Duration = Duration::from_secs(600);
 /// Duplicate queue requests within this window count as one click.
 const QUEUE_ADD_DEBOUNCE: Duration = Duration::from_millis(1500);
 /// How many played contexts the sidebar's Recently played order keeps.
@@ -487,6 +491,9 @@ pub struct App {
     pub radio_pages: HashMap<String, RadioPage>,
     pub track_cache: HashMap<String, Track>,
     track_requests: HashSet<String>,
+    /// The remembered song's id after a failed lookup, when it may be asked
+    /// about again, and the wait that set that time.
+    resume_track_retry: Option<(String, Instant, Duration)>,
     /// Album URIs already resolved or attempted through librespot this session.
     album_types_requested: HashSet<String>,
     /// Saved shows Spotify marks as audiobooks, which librespot cannot play;
@@ -967,6 +974,7 @@ impl App {
             radio_pages: HashMap::new(),
             track_cache: HashMap::new(),
             track_requests: HashSet::new(),
+            resume_track_retry: None,
             album_types_requested: HashSet::new(),
             audiobook_shows: HashSet::new(),
             audiobooks_requested: HashSet::new(),
@@ -2555,10 +2563,19 @@ impl App {
             self.track_used.insert(id, Instant::now());
             return;
         }
+        // A failed lookup is asked again after a growing wait, not on the
+        // next pass: a removed song or an exhausted quota would otherwise
+        // send a request per round trip for as long as the app is open.
+        if self
+            .resume_track_retry
+            .as_ref()
+            .is_some_and(|(failed, at, _)| *failed == id && Instant::now() < *at)
+        {
+            return;
+        }
         if !self.track_requests.insert(id.clone()) {
             return;
         }
-        // Asked again on every pass after a failure, so it is counted.
         counters::RESUME_TRACK_REQUESTS.incr();
         self.backend.api(ApiRequest::Track { id });
     }
@@ -6662,6 +6679,13 @@ impl App {
                             &format!("spotify:track:{id}"),
                             Some(PlayableItem::Track(track.clone())),
                         );
+                        if self
+                            .resume_track_retry
+                            .as_ref()
+                            .is_some_and(|(failed, ..)| *failed == id)
+                        {
+                            self.resume_track_retry = None;
+                        }
                         self.track_cache.insert(id.clone(), track);
                         self.track_used.insert(id, Instant::now());
                     }
@@ -6671,6 +6695,16 @@ impl App {
                         // recorded at most once per 30 s.
                         let resume_track = self.resume_track.as_deref().and_then(util::uri_id)
                             == Some(id.as_str());
+                        if resume_track {
+                            let wait = match &self.resume_track_retry {
+                                Some((failed, _, wait)) if *failed == id => {
+                                    (*wait * 2).min(RESUME_TRACK_RETRY_MAX)
+                                }
+                                _ => RESUME_TRACK_RETRY,
+                            };
+                            self.resume_track_retry =
+                                Some((id.clone(), Instant::now() + wait, wait));
+                        }
                         let record = if resume_track
                             && !counters::RESUME_TRACK_FAILURES.ready(Duration::from_secs(30))
                         {
@@ -19847,6 +19881,56 @@ mod tests {
             !app.track_cache.contains_key("decoy"),
             "an untouched cached track can go"
         );
+    }
+
+    #[test]
+    fn a_failed_resume_track_lookup_waits_before_asking_again() {
+        let mut app = headless_app();
+        app.resume_track = Some("spotify:track:gone".into());
+        app.request_resume_track();
+        assert!(app.track_requests.contains("gone"));
+        let not_found = || {
+            Err(crate::api::client::ApiError::Status {
+                status: 404,
+                message: "not found".into(),
+            })
+        };
+        app.handle_api(ApiResponse::Track {
+            id: "gone".into(),
+            result: not_found(),
+        });
+        app.request_resume_track();
+        assert!(
+            !app.track_requests.contains("gone"),
+            "the next pass must not ask again at once"
+        );
+        let (_, _, first) = app.resume_track_retry.clone().expect("a retry is planned");
+        assert_eq!(first, RESUME_TRACK_RETRY);
+
+        // #when the wait is over and the song still cannot be found
+        app.resume_track_retry.as_mut().unwrap().1 = Instant::now();
+        app.request_resume_track();
+        assert!(app.track_requests.contains("gone"));
+        app.handle_api(ApiResponse::Track {
+            id: "gone".into(),
+            result: not_found(),
+        });
+        let (_, _, second) = app.resume_track_retry.clone().expect("a retry is planned");
+        assert_eq!(second, RESUME_TRACK_RETRY * 2);
+
+        // #when it is found
+        app.resume_track_retry.as_mut().unwrap().1 = Instant::now();
+        app.request_resume_track();
+        app.handle_api(ApiResponse::Track {
+            id: "gone".into(),
+            result: Ok(Track {
+                id: Some("gone".into()),
+                uri: "spotify:track:gone".into(),
+                ..Track::default()
+            }),
+        });
+        assert!(app.resume_track_retry.is_none());
+        assert!(app.track_cache.contains_key("gone"));
     }
 
     #[test]
