@@ -5,7 +5,7 @@
 //! handles capability differences before dispatch.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,11 @@ use crate::telemetry;
 const BASE_URL: &str = "https://api.spotify.com/v1";
 const MAX_IN_FLIGHT: usize = 6;
 const RATE_LIMIT_RETRIES: u32 = 3;
+/// The longest one request waits out a cooldown before it fails. Queue
+/// appends wait the whole cooldown.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// The longest cooldown a Retry-After can start, against a garbled header.
+const MAX_COOLDOWN: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Debug, Error)]
 pub enum ApiError {
@@ -432,6 +436,8 @@ pub struct ApiClient {
     limiter: Semaphore,
     queue_writes: tokio::sync::Mutex<()>,
     cooldown_until: tokio::sync::Mutex<Instant>,
+    /// Whether the cooldown is for an exhausted Development Mode quota.
+    quota_cooldown: AtomicBool,
     search_limit: u32,
     artist_albums_limit: u32,
     source: ApiSource,
@@ -456,6 +462,7 @@ impl ApiClient {
             limiter: Semaphore::new(MAX_IN_FLIGHT),
             queue_writes: tokio::sync::Mutex::new(()),
             cooldown_until: tokio::sync::Mutex::new(Instant::now()),
+            quota_cooldown: AtomicBool::new(false),
             search_limit,
             artist_albums_limit,
             source,
@@ -533,19 +540,49 @@ impl ApiClient {
             .ok_or(ApiError::NotSignedIn)
     }
 
-    async fn wait_for_cooldown(&self) {
+    /// Waits out the cooldown. Unless `patient`, a request waits at most
+    /// [`MAX_RETRY_AFTER`] and then fails without being sent: a long penalty
+    /// is never hit again early, and a caller that retries on failure keeps
+    /// its pace.
+    async fn wait_for_cooldown(&self, patient: bool) -> Result<()> {
+        let started = Instant::now();
         loop {
             let until = *self.cooldown_until.lock().await;
-            let Some(wait) = until.checked_duration_since(Instant::now()) else {
-                return;
+            let Some(wait) = until
+                .checked_duration_since(Instant::now())
+                .filter(|wait| !wait.is_zero())
+            else {
+                return Ok(());
             };
+            if !patient {
+                let left = MAX_RETRY_AFTER.saturating_sub(started.elapsed());
+                if wait > left {
+                    tokio::time::sleep(left).await;
+                    if self.cooling_down().await {
+                        return Err(if self.quota_cooldown.load(Ordering::Relaxed) {
+                            ApiError::QuotaExhausted
+                        } else {
+                            ApiError::RateLimited
+                        });
+                    }
+                    continue;
+                }
+            }
             tokio::time::sleep(wait).await;
         }
     }
 
-    async fn extend_cooldown(&self, wait: Duration) {
+    async fn cooling_down(&self) -> bool {
+        *self.cooldown_until.lock().await > Instant::now()
+    }
+
+    async fn extend_cooldown(&self, wait: Duration, quota: bool) {
         let mut until = self.cooldown_until.lock().await;
-        *until = (*until).max(Instant::now() + wait);
+        let asked = Instant::now() + wait.min(MAX_COOLDOWN);
+        if asked > *until {
+            *until = asked;
+            self.quota_cooldown.store(quota, Ordering::Relaxed);
+        }
         self.probe
             .cooldown_until_ms
             .store(clock_at(*until), Ordering::Relaxed);
@@ -596,28 +633,40 @@ impl ApiClient {
         loop {
             attempt = u32::saturating_add(attempt, 1);
             probe.begin(attempt);
-            self.wait_for_cooldown().await;
-            probe.cooled();
-            let waiting = Waiting::new(&self.probe.permit_waiters);
-            let permit = self
-                .limiter
-                .acquire()
-                .await
-                .map_err(|_| ApiError::NotSignedIn)?;
-            drop(waiting);
-            probe.permitted();
-            let mut token_lock = Duration::ZERO;
-            let token = match provider.access_token(&mut token_lock).await {
-                Ok(token) => token,
-                Err(error) => {
-                    probe.tokened(token_lock);
-                    probe.finish("token_failed", None, None, |event| {
-                        event.text("error", &error.to_string())
-                    });
+            let (permit, token) = loop {
+                if let Err(error) = self.wait_for_cooldown(queue_write).await {
+                    probe.finish("cooldown_refused", None, None, |event| event);
                     return Err(error);
                 }
+                probe.cooled();
+                let waiting = Waiting::new(&self.probe.permit_waiters);
+                let permit = self
+                    .limiter
+                    .acquire()
+                    .await
+                    .map_err(|_| ApiError::NotSignedIn)?;
+                drop(waiting);
+                probe.permitted();
+                let mut token_lock = Duration::ZERO;
+                let token = match provider.access_token(&mut token_lock).await {
+                    Ok(token) => token,
+                    Err(error) => {
+                        probe.tokened(token_lock);
+                        probe.finish("token_failed", None, None, |event| {
+                            event.text("error", &error.to_string())
+                        });
+                        return Err(error);
+                    }
+                };
+                probe.tokened(token_lock);
+                // A 429 that arrived while this request waited for a permit
+                // or the token started a cooldown that applies to it too.
+                if !self.cooling_down().await {
+                    break (permit, token);
+                }
+                drop(permit);
+                probe.enter("cooldown");
             };
-            probe.tokened(token_lock);
             let http = match self.http.client() {
                 Ok(http) => http,
                 Err(error) => {
@@ -665,29 +714,32 @@ impl ApiClient {
                     .map_or(Duration::from_secs(1), Duration::from_secs);
                 let text = response.text().await.unwrap_or_default();
                 if is_quota_exhausted(&text) {
+                    // Every later request on this grant would be refused
+                    // too: they wait out the same cooldown instead.
+                    self.extend_cooldown(wait, true).await;
+                    drop(permit);
                     probe.rate_limited(wait, None, &text, 0, false);
                     probe.finished = true;
                     return Err(ApiError::QuotaExhausted);
                 }
                 let asked = wait;
-                // A rejected queue append is safe to retry. Keep its place
-                // in the write lock and honor the full server-requested wait.
-                // Other requests retain their existing bounded retry policy.
-                let wait = if queue_write {
-                    wait
-                } else {
-                    wait.min(MAX_RETRY_AFTER)
-                };
+                // The whole wait Spotify asked for applies to every request
+                // on this grant. A rejected queue append is safe to retry and
+                // keeps its place in the write lock; other requests retain
+                // their bounded retry policy and wait at most MAX_RETRY_AFTER.
+                let wait = wait.min(MAX_COOLDOWN);
                 log::warn!("Spotify rate limit source={} wait={wait:?}", self.source);
                 log::info!(
                     "Spotify cooldown source={} duration_ms={}",
                     self.source,
                     wait.as_millis()
                 );
-                drop(permit);
                 probe.enter("cooldown_extend");
                 let before = self.cooldown_remaining_ms();
-                self.extend_cooldown(wait).await;
+                // Extended before the permit is released, so the request
+                // that takes it next sees the cooldown.
+                self.extend_cooldown(wait, false).await;
+                drop(permit);
                 let gave_up = !queue_write && attempt > RATE_LIMIT_RETRIES;
                 probe.rate_limited(asked, Some(wait), &text, before, gave_up);
                 if !queue_write && attempt > RATE_LIMIT_RETRIES {
@@ -2915,6 +2967,184 @@ mod tests {
         ));
     }
 
+    fn test_client(address: std::net::SocketAddr, name: &str) -> ApiClient {
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut client = ApiClient::new(
+            http.clone(),
+            Arc::new(NetActivity::default()),
+            20,
+            50,
+            ApiSource::Personal,
+        );
+        client.base_url = Some(format!("http://{address}"));
+        let root = std::env::temp_dir().join(format!("unused-{name}-token"));
+        client.set_token_provider(Some(TokenProvider::Web(WebTokens::new(
+            http,
+            crate::auth::StoredToken {
+                access_token: "test-only".into(),
+                expires_at: u64::MAX,
+                ..Default::default()
+            },
+            crate::credentials::Store::in_memory(crate::paths::AppDirs {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+            })
+            .lease(crate::credentials::Slot::Personal),
+            ApiSource::Personal,
+            Arc::new(|_| {}),
+        ))));
+        client
+    }
+
+    /// Reads one request's head from `socket`.
+    async fn read_head(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(socket.read_u8().await.unwrap());
+            assert!(request.len() < 8192);
+        }
+    }
+
+    /// Requests already waiting for a permit when a 429 arrives must not go
+    /// out during the cooldown it starts: that is how one rate limit turned
+    /// into a burst of them.
+    #[tokio::test]
+    async fn requests_queued_behind_a_rate_limit_wait_out_its_cooldown() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let arrivals: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let limited_at: Arc<Mutex<Option<Instant>>> = Arc::default();
+        let all_in = Arc::new(tokio::sync::Barrier::new(MAX_IN_FLIGHT));
+        let server = {
+            let (arrivals, limited_at) = (arrivals.clone(), limited_at.clone());
+            tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let (arrivals, limited_at) = (arrivals.clone(), limited_at.clone());
+                    let all_in = all_in.clone();
+                    tokio::spawn(async move {
+                        read_head(&mut socket).await;
+                        let index = {
+                            let mut arrivals = arrivals.lock().unwrap();
+                            arrivals.push(Instant::now());
+                            arrivals.len() - 1
+                        };
+                        let reply = if index < MAX_IN_FLIGHT {
+                            // Every permit is taken; one more request waits.
+                            all_in.wait().await;
+                            if index == 0 {
+                                *limited_at.lock().unwrap() = Some(Instant::now());
+                                "429 Too Many Requests\r\nRetry-After: 1"
+                            } else {
+                                // Answered only after the 429, so no permit
+                                // frees before the cooldown starts.
+                                while limited_at.lock().unwrap().is_none() {
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                "200 OK"
+                            }
+                        } else {
+                            "200 OK"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {reply}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                        );
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                    });
+                }
+            })
+        };
+        let client = test_client(address, "queued-cooldown");
+        let send = || client.send(Method::GET, "/me", &[], None);
+        let results = tokio::join!(send(), send(), send(), send(), send(), send(), send());
+        server.abort();
+        for result in [
+            results.0, results.1, results.2, results.3, results.4, results.5, results.6,
+        ] {
+            result.unwrap();
+        }
+        let limited_at = limited_at.lock().unwrap().unwrap();
+        let arrivals = arrivals.lock().unwrap();
+        // The six that took every permit, the one queued behind them, and
+        // the limited request's retry.
+        assert_eq!(arrivals.len(), MAX_IN_FLIGHT + 2);
+        for arrival in &arrivals[MAX_IN_FLIGHT..] {
+            assert!(
+                arrival.duration_since(limited_at) >= Duration::from_millis(900),
+                "a request went out {:?} into a 1 s cooldown",
+                arrival.duration_since(limited_at)
+            );
+        }
+    }
+
+    /// A Retry-After longer than one request will wait fails the requests
+    /// that meet it, without sending them; queue appends wait it out. An
+    /// exhausted quota starts the same cooldown and is reported as such.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_cooldown_fails_requests_without_sending_them() {
+        let client = ApiClient::new(
+            reqwest::Client::new(),
+            Arc::new(NetActivity::default()),
+            20,
+            50,
+            ApiSource::Shared,
+        );
+        client
+            .extend_cooldown(Duration::from_secs(120), false)
+            .await;
+        assert!(matches!(
+            client.wait_for_cooldown(false).await,
+            Err(ApiError::RateLimited)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), client.wait_for_cooldown(true))
+                .await
+                .is_err(),
+            "a queue append waits the whole cooldown"
+        );
+        let quota = ApiClient::new(
+            reqwest::Client::new(),
+            Arc::new(NetActivity::default()),
+            20,
+            50,
+            ApiSource::Personal,
+        );
+        quota.extend_cooldown(Duration::from_secs(120), true).await;
+        assert!(matches!(
+            quota.wait_for_cooldown(false).await,
+            Err(ApiError::QuotaExhausted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_quota_starts_a_cooldown() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_head(&mut socket).await;
+            let body = r#"{"error":{"status":429,"reason":"QUOTA_EXCEEDED"}}"#;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = test_client(address, "quota-cooldown");
+        assert!(matches!(
+            client.send(Method::GET, "/me", &[], None).await,
+            Err(ApiError::QuotaExhausted)
+        ));
+        server.await.unwrap();
+        assert!(client.cooling_down().await);
+        assert!(client.quota_cooldown.load(Ordering::Relaxed));
+    }
+
     #[tokio::test]
     async fn cooldown_state_is_owned_by_one_session() {
         let activity = Arc::new(NetActivity::default());
@@ -2932,7 +3162,7 @@ mod tests {
             10,
             ApiSource::Personal,
         );
-        shared.extend_cooldown(Duration::from_secs(10)).await;
+        shared.extend_cooldown(Duration::from_secs(10), false).await;
         assert!(*shared.cooldown_until.lock().await > Instant::now());
         assert!(*personal.cooldown_until.lock().await <= Instant::now());
     }

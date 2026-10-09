@@ -185,8 +185,13 @@ rows are placeholders until their page arrives; scrolling never starts playback.
 ## When Spotify pushes back
 
 Each Web API session has separate concurrency and rate limits. A `Retry-After`
-response pauses only that session. Spotifast routes each request once and
-does not retry it through the other app. A playlist read the librespot session
+response pauses only that session, for as long as Spotify asks (up to an
+hour). Requests already waiting for that session wait too, rather than going
+out into the pause. A request waits at most 30 seconds; if the pause is longer
+it fails without being sent, so a long pause is never hit again early. A
+quota Spotify reports as exhausted pauses the session the same way. Spotifast
+routes each request once and does not retry it through the other app. A rate
+limit or timeout while renewing a sign-in keeps the sign-in. A playlist read the librespot session
 refuses outright, because the playlist is gone or private, is shown as such. A
 dropped connection, a read that takes longer than 30 seconds, or a page whose
 song details Spotify did not supply in full, hands the read to the Web API
