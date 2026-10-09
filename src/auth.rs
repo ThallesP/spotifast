@@ -444,7 +444,13 @@ fn decode_token_response(
     status: reqwest::StatusCode,
     text: &str,
 ) -> std::result::Result<TokenResponse, TokenEndpointError> {
-    if status.is_client_error() {
+    // A timeout or a rate limit says nothing about the grant: treating it
+    // as a rejection would forget a working sign-in.
+    let transient = matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
+    if status.is_client_error() && !transient {
         let value = serde_json::from_str::<serde_json::Value>(text).ok();
         // OAuth descriptions and malformed bodies may contain usable grants.
         // Report only known classifications, never authorization response text.
@@ -646,6 +652,29 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_rate_limited_or_timed_out_refresh_keeps_the_grant() {
+        for status in [408, 429, 500, 503] {
+            let error = decode_token_response(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                r#"{"error":"invalid_grant"}"#,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, TokenEndpointError::Unreachable(_)),
+                "{status} must not forget the sign-in"
+            );
+        }
+        for status in [400, 401, 403] {
+            let error = decode_token_response(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                r#"{"error":"invalid_grant"}"#,
+            )
+            .unwrap_err();
+            assert!(matches!(error, TokenEndpointError::Rejected { .. }));
+        }
+    }
 
     #[test]
     fn old_web_grants_require_image_upload_consent() {
