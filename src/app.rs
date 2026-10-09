@@ -5556,8 +5556,13 @@ impl App {
                     }
                     // Keep the optimistic queue and retry after a stale
                     // response. Accept Spotify's state after the retry limit.
-                    self.queue_stale_retries = self.queue_stale_retries.saturating_add(1);
-                    self.queue_recheck_at = Some(Instant::now() + QUEUE_RECHECK);
+                    // While a write is under way every answer predates it,
+                    // and the write's completion asks again: polling until
+                    // then only spends requests.
+                    if !writing_queue {
+                        self.queue_stale_retries = self.queue_stale_retries.saturating_add(1);
+                        self.queue_recheck_at = Some(Instant::now() + QUEUE_RECHECK);
+                    }
                     return;
                 }
                 let retries = self.queue_stale_retries;
@@ -15248,6 +15253,41 @@ mod tests {
         assert_eq!(row.uri(), track.uri);
         assert_eq!(row.name(), track.name);
         assert_eq!(row.duration_ms(), track.duration_ms);
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn a_queue_write_in_progress_does_not_poll_the_queue() {
+        let mut app = test_app("queue-write-no-poll");
+        app.auth = AuthStatus::Connected {
+            username: "alice".into(),
+        };
+        app.queue = loaded_queue("spotify:track:current", &["spotify:track:context"]);
+        let old = app.queue.get().unwrap().clone();
+        let track = album_queue_track("single");
+        app.add_to_queue(track.uri.clone(), track.name.clone());
+        let request = app.album_queue_serial;
+        assert!(!app.pending_queue_batches.is_empty());
+        app.queue_recheck_at = None;
+        app.handle_api(ApiResponse::Queue {
+            seq: app.queue_seq,
+            result: Ok(old),
+        });
+        assert!(
+            app.queue_recheck_at.is_none(),
+            "an answer during the write must not schedule another read"
+        );
+        assert_eq!(app.queue_stale_retries, 0);
+        let seq = app.queue_seq;
+        app.handle_api(ApiResponse::QueueBatchAdded {
+            request,
+            added: 1,
+            result: Ok(()),
+        });
+        assert!(
+            app.queue_seq > seq,
+            "the finished write reads the queue again"
+        );
         app.backend.shutdown();
     }
 
